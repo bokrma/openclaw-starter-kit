@@ -1,0 +1,80 @@
+services:
+  openclaw-gateway:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      PATH: /home/node/.openclaw/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      TERM: xterm-256color
+      OPENCLAW_GATEWAY_TOKEN: ${OPENCLAW_GATEWAY_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SUPERMEMORY_API_KEY: ${SUPERMEMORY_API_KEY:-}
+      SUPERMEMORY_OPENCLAW_API_KEY: ${SUPERMEMORY_OPENCLAW_API_KEY:-}
+      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY:-}
+      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY:-}
+      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE:-}
+    init: true
+    restart: unless-stopped
+    command:
+      [
+        "node",
+        "dist/index.js",
+        "gateway",
+        "--bind",
+        "lan",
+        "--port",
+        "18789",
+      ]
+    volumes:
+      - openclaw-safe-home:/home/node
+    ports:
+      - "127.0.0.1:${OPENCLAW_GATEWAY_PORT:-18789}:18789"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,mode=1777
+      - /var/tmp:rw,mode=1777
+      - /run:rw,mode=755
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - openclaw-safe-net
+
+  openclaw-cli:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    environment:
+      HOME: /home/node
+      PATH: /home/node/.openclaw/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      TERM: xterm-256color
+      BROWSER: echo
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SUPERMEMORY_API_KEY: ${SUPERMEMORY_API_KEY:-}
+      SUPERMEMORY_OPENCLAW_API_KEY: ${SUPERMEMORY_OPENCLAW_API_KEY:-}
+      CLAUDE_AI_SESSION_KEY: ${CLAUDE_AI_SESSION_KEY:-}
+      CLAUDE_WEB_SESSION_KEY: ${CLAUDE_WEB_SESSION_KEY:-}
+      CLAUDE_WEB_COOKIE: ${CLAUDE_WEB_COOKIE:-}
+    stdin_open: true
+    tty: true
+    init: true
+    entrypoint: ["node", "dist/index.js"]
+    volumes:
+      - openclaw-safe-home:/home/node
+    read_only: true
+    tmpfs:
+      - /tmp:rw,mode=1777
+      - /var/tmp:rw,mode=1777
+      - /run:rw,mode=755
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - openclaw-safe-net
+
+networks:
+  openclaw-safe-net: {}
+
+volumes:
+  openclaw-safe-home:
