@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OPENCLAW_SRC_DIR="${OPENCLAW_SRC_DIR:-$ROOT_DIR/vendor/openclaw}"
+ENV_FILE="$ROOT_DIR/.env"
 SAFE_COMPOSE_TEMPLATE="$ROOT_DIR/docker-compose.safe.yml"
 FULL_RESET=false
 COMPOSE_CMD=()
@@ -79,6 +79,23 @@ resolve_compose() {
 }
 
 maybe_delegate_to_powershell "$@"
+
+if [[ -f "$ENV_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="${line#$'\ufeff'}"
+    [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      export "${line%%=*}=${line#*=}"
+    fi
+  done <"$ENV_FILE"
+fi
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-openclaw-easy}"
+export OPENCLAW_SAFE_PROJECT_NAME="${OPENCLAW_SAFE_PROJECT_NAME:-$COMPOSE_PROJECT_NAME}"
+OPENCLAW_SRC_DIR="${OPENCLAW_SRC_DIR:-$ROOT_DIR/vendor/openclaw}"
+OPENCLAW_MISSION_CONTROL_SRC_DIR="${OPENCLAW_MISSION_CONTROL_SRC_DIR:-$ROOT_DIR/vendor/openclaw-mission-control}"
+OPENCLAW_COMMAND_CENTER_SRC_DIR="${OPENCLAW_COMMAND_CENTER_SRC_DIR:-$ROOT_DIR/vendor/openclaw-command-center}"
+
 resolve_compose
 
 if [[ -d "$OPENCLAW_SRC_DIR" ]]; then
@@ -90,16 +107,40 @@ if [[ -d "$OPENCLAW_SRC_DIR" ]]; then
   (
     cd "$OPENCLAW_SRC_DIR"
     if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
-      "${COMPOSE_CMD[@]}" -f docker-compose.safe.yml down -v --remove-orphans || true
+      "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}" --env-file "$OPENCLAW_SRC_DIR/.env" -f docker-compose.safe.yml down -v --remove-orphans || true
     fi
   )
 else
   log "OpenClaw source not found, skipping docker compose reset"
 fi
 
+if [[ -d "$OPENCLAW_MISSION_CONTROL_SRC_DIR" && -f "$OPENCLAW_MISSION_CONTROL_SRC_DIR/compose.yml" ]]; then
+  log "Stopping and removing Mission Control Docker stack"
+  (
+    cd "$OPENCLAW_MISSION_CONTROL_SRC_DIR"
+    if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
+      "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}-mission-control" --env-file "$OPENCLAW_MISSION_CONTROL_SRC_DIR/.env" -f compose.yml down -v --remove-orphans || true
+    fi
+  )
+fi
+
+if [[ -f "$ROOT_DIR/command-center.compose.yml" ]]; then
+  log "Stopping and removing Command Center Docker stack"
+  (
+    cd "$ROOT_DIR"
+    if [[ ${#COMPOSE_CMD[@]} -gt 0 ]]; then
+      "${COMPOSE_CMD[@]}" -p "${COMPOSE_PROJECT_NAME}-command-center" --env-file "$ENV_FILE" -f command-center.compose.yml down -v --remove-orphans || true
+    fi
+  )
+fi
+
 if [[ "$FULL_RESET" == true ]]; then
   log "Removing cloned OpenClaw source"
   rm -rf "$OPENCLAW_SRC_DIR"
+  log "Removing cloned Mission Control source"
+  rm -rf "$OPENCLAW_MISSION_CONTROL_SRC_DIR"
+  log "Removing cloned Command Center source"
+  rm -rf "$OPENCLAW_COMMAND_CENTER_SRC_DIR"
 fi
 
 log "Reset complete"

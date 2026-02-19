@@ -1,0 +1,42 @@
+services:
+  openclaw-command-center:
+    image: ${OPENCLAW_IMAGE:-openclaw:local}
+    working_dir: /opt/openclaw-command-center
+    command: ["node", "lib/server.js"]
+    init: true
+    restart: unless-stopped
+    environment:
+      HOME: /home/node
+      PATH: /home/node/.local/bin:/home/node/.openclaw/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      PORT: ${OPENCLAW_COMMAND_CENTER_PORT:-3340}
+      OPENCLAW_WORKSPACE: /home/node/.openclaw/workspace
+      OPENCLAW_PROFILE: ${OPENCLAW_COMMAND_CENTER_OPENCLAW_PROFILE:-}
+      DASHBOARD_AUTH_MODE: ${OPENCLAW_COMMAND_CENTER_AUTH_MODE:-token}
+      DASHBOARD_TOKEN: ${OPENCLAW_COMMAND_CENTER_TOKEN:-}
+      DASHBOARD_ALLOWED_USERS: ${OPENCLAW_COMMAND_CENTER_ALLOWED_USERS:-*}
+      DASHBOARD_ALLOWED_IPS: ${OPENCLAW_COMMAND_CENTER_ALLOWED_IPS:-127.0.0.1,::1}
+    volumes:
+      - ${OPENCLAW_COMMAND_CENTER_SRC_DIR:-./vendor/openclaw-command-center}:/opt/openclaw-command-center
+      - openclaw-safe-home:/home/node
+    ports:
+      - "127.0.0.1:${OPENCLAW_COMMAND_CENTER_PORT:-3340}:${OPENCLAW_COMMAND_CENTER_PORT:-3340}"
+    tmpfs:
+      - /tmp:rw,mode=1777
+      - /var/tmp:rw,mode=1777
+      - /run:rw,mode=755
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - openclaw-safe-net
+
+networks:
+  openclaw-safe-net:
+    name: ${OPENCLAW_SAFE_PROJECT_NAME:-openclaw-easy}_openclaw-safe-net
+    external: true
+
+volumes:
+  openclaw-safe-home:
+    name: ${OPENCLAW_SAFE_PROJECT_NAME:-openclaw-easy}_openclaw-safe-home
+    external: true

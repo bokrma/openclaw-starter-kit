@@ -1,2 +1,5 @@
 .env
 vendor/
+.tmp-openclaw-command-center/
+.tmp-openclaw-mission-control/
+.tmp_backend_requirements.txt

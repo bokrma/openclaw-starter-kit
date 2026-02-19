@@ -1,0 +1,14 @@
+{
+  "name": "Main Board",
+  "slug": "main-board",
+  "description": "Primary board for OpenClaw automation.",
+  "perspective": "Pragmatic execution: prioritize outcomes, clear ownership, and fast feedback loops.",
+  "board_type": "goal",
+  "goal_confirmed": false,
+  "objective": "",
+  "success_metrics": {},
+  "target_date": "",
+  "goal_source": "",
+  "group_id": "",
+  "max_agents": 1
+}
