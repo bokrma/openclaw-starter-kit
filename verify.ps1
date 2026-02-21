@@ -454,6 +454,23 @@ if (-not $browserProbe.Ready) {
     throw "Browser control service probe failed: $($browserProbe.Detail)"
 }
 
+$agentManifestPath = Join-Path (Join-Path (Join-Path $RootDir "openclaw-agents") "agents") "manifest.json"
+if (-not (Test-Path $agentManifestPath)) {
+    throw "Agent manifest is missing: $agentManifestPath"
+}
+$agentManifestRaw = Get-Content -Path $agentManifestPath -Raw
+$agentManifest = $agentManifestRaw | ConvertFrom-Json
+$agentManifestEntries = @(
+    foreach ($item in @($agentManifest.agents)) {
+        [PSCustomObject]@{
+            id = "$($item.id)".Trim()
+            name = "$($item.name)".Trim()
+            default = [bool]$item.default
+        }
+    }
+)
+$agentManifestJson = $agentManifestEntries | ConvertTo-Json -Compress
+
 Write-Step "Checking agent pack + coordinator wiring"
 $agentCheckScript = @'
 import { loadConfig } from "/app/dist/config/config.js";
@@ -462,10 +479,11 @@ import { resolveAgentMainSessionKey } from "/app/dist/config/sessions/main-sessi
 import { resolveGatewaySessionStoreTarget } from "/app/dist/gateway/session-utils.js";
 import { normalizeAgentId } from "/app/dist/routing/session-key.js";
 
-const required = [
-  "main", "dev", "backend", "frontend", "designer", "ux", "db", "pm",
-  "qa", "research", "ops", "growth", "finance", "stocks", "creative", "motivation",
-];
+const manifestAgentsRaw = JSON.parse(process.env.OPENCLAW_AGENT_MANIFEST ?? "[]");
+const manifestAgents = Array.isArray(manifestAgentsRaw) ? manifestAgentsRaw : [];
+const required = manifestAgents
+  .map((item) => normalizeAgentId(String(item?.id ?? "")))
+  .filter((id) => Boolean(id));
 
 const cfg = loadConfig();
 const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
@@ -477,6 +495,9 @@ for (const entry of agents) {
 }
 
 const issues = [];
+if (required.length === 0) {
+  issues.push("agent manifest is empty; expected at least one agent");
+}
 const missingAgents = required.filter((id) => !byId.has(id));
 if (missingAgents.length > 0) {
   issues.push(`missing agents: ${missingAgents.join(", ")}`);
@@ -484,8 +505,14 @@ if (missingAgents.length > 0) {
 
 const main = byId.get("main");
 const mainName = String(main?.name ?? "").trim();
-if (mainName !== "Jarvis") {
-  issues.push(`main agent name should be Jarvis (found: ${mainName || "<empty>"})`);
+const defaultManifestAgent =
+  manifestAgents.find((item) => item?.default === true) ??
+  manifestAgents.find((item) => normalizeAgentId(String(item?.id ?? "")) === "main");
+const expectedMainName = String(defaultManifestAgent?.name ?? "Jarvis").trim();
+if (mainName !== expectedMainName) {
+  issues.push(
+    `main agent name should be ${expectedMainName || "Jarvis"} (found: ${mainName || "<empty>"})`,
+  );
 }
 const allowAgents = Array.isArray(main?.subagents?.allowAgents)
   ? main.subagents.allowAgents.map((value) => String(value).trim())
@@ -517,15 +544,28 @@ if (issues.length > 0) {
 
 console.log("ok");
 '@
-Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @(
-    "run", "--rm", "--entrypoint", "sh", "openclaw-cli", "-lc", @'
+$agentCheckShell = @'
 set -eu
 cat > /tmp/openclaw-agent-check.mjs <<'"'"'NODE'"'"'
 __OPENCLAW_AGENT_CHECK_SCRIPT__
 NODE
-node /tmp/openclaw-agent-check.mjs
-'@.Replace("__OPENCLAW_AGENT_CHECK_SCRIPT__", $agentCheckScript)
-) | Out-Null
+cat > /tmp/openclaw-agent-manifest.json <<'"'"'JSON'"'"'
+__OPENCLAW_AGENT_MANIFEST_JSON__
+JSON
+OPENCLAW_AGENT_MANIFEST="$(cat /tmp/openclaw-agent-manifest.json)" node /tmp/openclaw-agent-check.mjs
+'@
+$agentCheckShell = $agentCheckShell.Replace("__OPENCLAW_AGENT_CHECK_SCRIPT__", $agentCheckScript)
+$agentCheckShell = $agentCheckShell.Replace("__OPENCLAW_AGENT_MANIFEST_JSON__", $agentManifestJson)
+
+$agentCheckResult = Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @(
+    "run", "--rm", "--entrypoint", "sh", "openclaw-cli", "-lc", $agentCheckShell
+) -Capture -IgnoreExitCode
+if ($agentCheckResult.Code -ne 0) {
+    foreach ($line in @($agentCheckResult.Output)) {
+        Write-Host $line
+    }
+    throw "Agent pack + coordinator wiring validation failed."
+}
 
 $supermemoryEnabled = if ($env:OPENCLAW_ENABLE_SUPERMEMORY) { $env:OPENCLAW_ENABLE_SUPERMEMORY } elseif ($env:SUPERMEMORY_OPENCLAW_API_KEY) { "true" } else { "false" }
 if ($supermemoryEnabled -eq "true") {

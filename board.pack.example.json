@@ -1,0 +1,358 @@
+{
+  "version": 1,
+  "groups": [
+    {
+      "name": "Engineering",
+      "slug": "engineering",
+      "description": "Build, maintain, and ship the OpenClaw stack."
+    },
+    {
+      "name": "Intelligence Lab",
+      "slug": "intelligence-lab",
+      "description": "Research workflows, benchmarks, and knowledge capture."
+    },
+    {
+      "name": "Personal OS",
+      "slug": "personal-os",
+      "description": "Life operations, memory, health, and wealth execution."
+    }
+  ],
+  "boards": [
+    {
+      "name": "Developer Board",
+      "slug": "developer-board",
+      "group_slug": "engineering",
+      "description": "Engineering roadmap and delivery board.",
+      "perspective": "Prioritize maintainability, testability, and clear ownership.",
+      "board_type": "goal",
+      "goal_confirmed": true,
+      "objective": "Ship stable weekly releases with automated QA.",
+      "max_agents": 4
+    },
+    {
+      "name": "Researcher Board",
+      "slug": "researcher-board",
+      "group_slug": "intelligence-lab",
+      "description": "Research planning, experiments, and evidence logs.",
+      "perspective": "Prefer measurable experiments and cite reproducible evidence.",
+      "board_type": "goal",
+      "goal_confirmed": true,
+      "objective": "Run high-value experiments and publish actionable findings.",
+      "max_agents": 3
+    },
+    {
+      "name": "Life Memory Board",
+      "slug": "life-memory-board",
+      "group_slug": "personal-os",
+      "description": "Personal assistant operating board for routines and memory.",
+      "perspective": "Turn intentions into routines and keep memory retrieval fast.",
+      "board_type": "goal",
+      "goal_confirmed": true,
+      "objective": "Maintain reliable daily routines and life memory snapshots.",
+      "max_agents": 2
+    },
+    {
+      "name": "Health Assistant Board",
+      "slug": "health-assistant-board",
+      "group_slug": "personal-os",
+      "description": "Health habits, metrics, and check-in workflows.",
+      "perspective": "Track trends, not one-off noise, and favor consistency.",
+      "board_type": "goal",
+      "goal_confirmed": true,
+      "objective": "Keep weekly health actions consistent and measurable.",
+      "max_agents": 2
+    },
+    {
+      "name": "Wealth Maker Board",
+      "slug": "wealth-maker-board",
+      "group_slug": "personal-os",
+      "description": "Portfolio review, stock analysis, and wealth strategy.",
+      "perspective": "Focus on risk-adjusted decisions and long-term discipline.",
+      "board_type": "goal",
+      "goal_confirmed": true,
+      "objective": "Build repeatable investment review and execution cycles.",
+      "max_agents": 2
+    }
+  ],
+  "tags": [
+    {
+      "name": "Developer",
+      "slug": "developer",
+      "description": "Engineering implementation and platform tasks."
+    },
+    {
+      "name": "Research",
+      "slug": "research",
+      "description": "Experimentation and analysis tasks."
+    },
+    {
+      "name": "Personal",
+      "slug": "personal",
+      "description": "Personal assistant and life management tasks."
+    },
+    {
+      "name": "Health",
+      "slug": "health",
+      "description": "Health routines and metrics."
+    },
+    {
+      "name": "Finance",
+      "slug": "finance",
+      "description": "Finance and investment workflows."
+    },
+    {
+      "name": "Starter",
+      "slug": "starter",
+      "description": "Initial bootstrapped tasks and memory."
+    }
+  ],
+  "custom_fields": [
+    {
+      "field_key": "priority_lane",
+      "label": "Priority Lane",
+      "field_type": "text",
+      "required": false,
+      "board_slugs": [
+        "developer-board",
+        "researcher-board",
+        "life-memory-board",
+        "health-assistant-board",
+        "wealth-maker-board"
+      ]
+    },
+    {
+      "field_key": "success_signal",
+      "label": "Success Signal",
+      "field_type": "text",
+      "required": false,
+      "board_slugs": [
+        "developer-board",
+        "researcher-board",
+        "life-memory-board",
+        "health-assistant-board",
+        "wealth-maker-board"
+      ]
+    }
+  ],
+  "group_memory": [
+    {
+      "group_slug": "engineering",
+      "key": "engineering-operating-principles",
+      "content": "Ship small, test before merge, and keep rollback paths clear.",
+      "tags": [
+        "starter",
+        "engineering"
+      ],
+      "source": "board-pack"
+    },
+    {
+      "group_slug": "intelligence-lab",
+      "key": "research-operating-principles",
+      "content": "Every claim needs evidence, baseline, and confidence level.",
+      "tags": [
+        "starter",
+        "research"
+      ],
+      "source": "board-pack"
+    },
+    {
+      "group_slug": "personal-os",
+      "key": "personal-operating-principles",
+      "content": "Simple systems win: daily check-ins, weekly reviews, monthly resets.",
+      "tags": [
+        "starter",
+        "personal"
+      ],
+      "source": "board-pack"
+    }
+  ],
+  "starter_memory": [
+    {
+      "board_slug": "developer-board",
+      "key": "dev-definition-of-done",
+      "content": "Done means tests pass, logs are clean, and docs are updated.",
+      "tags": [
+        "developer",
+        "starter"
+      ],
+      "source": "board-pack"
+    },
+    {
+      "board_slug": "researcher-board",
+      "key": "research-template",
+      "content": "Hypothesis -> method -> evidence -> decision -> next experiment.",
+      "tags": [
+        "research",
+        "starter"
+      ],
+      "source": "board-pack"
+    },
+    {
+      "board_slug": "life-memory-board",
+      "key": "daily-life-rhythm",
+      "content": "Morning plan, midday check, evening reflection with captured learnings.",
+      "tags": [
+        "personal",
+        "starter"
+      ],
+      "source": "board-pack"
+    },
+    {
+      "board_slug": "health-assistant-board",
+      "key": "health-baseline",
+      "content": "Track sleep, hydration, movement, and weekly trend notes.",
+      "tags": [
+        "health",
+        "starter"
+      ],
+      "source": "board-pack"
+    },
+    {
+      "board_slug": "wealth-maker-board",
+      "key": "investment-framework",
+      "content": "Analyze thesis, valuation, risk, and clear invalidation points before action.",
+      "tags": [
+        "finance",
+        "starter"
+      ],
+      "source": "board-pack"
+    }
+  ],
+  "starter_tasks": [
+    {
+      "board_slug": "developer-board",
+      "key": "dev-audit-current-pipeline",
+      "title": "Audit current CI and QA pipeline",
+      "description": "List missing tests, flaky checks, and deployment risks.",
+      "status": "inbox",
+      "priority": "high",
+      "tag_slugs": [
+        "developer",
+        "starter"
+      ]
+    },
+    {
+      "board_slug": "developer-board",
+      "key": "dev-build-release-checklist",
+      "title": "Create release checklist v1",
+      "description": "Define pre-release validation, rollback steps, and ownership.",
+      "status": "inbox",
+      "priority": "high",
+      "tag_slugs": [
+        "developer",
+        "starter"
+      ],
+      "depends_on_keys": [
+        "dev-audit-current-pipeline"
+      ]
+    },
+    {
+      "board_slug": "researcher-board",
+      "key": "research-pick-three-hypotheses",
+      "title": "Pick top 3 research hypotheses",
+      "description": "Rank by expected impact and feasibility.",
+      "status": "inbox",
+      "priority": "high",
+      "tag_slugs": [
+        "research",
+        "starter"
+      ]
+    },
+    {
+      "board_slug": "researcher-board",
+      "key": "research-create-evidence-template",
+      "title": "Create evidence capture template",
+      "description": "Standardize experiment logging for repeatable analysis.",
+      "status": "inbox",
+      "priority": "medium",
+      "tag_slugs": [
+        "research",
+        "starter"
+      ],
+      "depends_on_keys": [
+        "research-pick-three-hypotheses"
+      ]
+    },
+    {
+      "board_slug": "life-memory-board",
+      "key": "life-map-core-routines",
+      "title": "Map daily and weekly routines",
+      "description": "Capture mandatory habits and schedule anchors.",
+      "status": "inbox",
+      "priority": "high",
+      "tag_slugs": [
+        "personal",
+        "starter"
+      ]
+    },
+    {
+      "board_slug": "life-memory-board",
+      "key": "life-build-memory-capture-flow",
+      "title": "Build life memory capture flow",
+      "description": "Define where and how important events are stored and reviewed.",
+      "status": "inbox",
+      "priority": "medium",
+      "tag_slugs": [
+        "personal",
+        "starter"
+      ],
+      "depends_on_keys": [
+        "life-map-core-routines"
+      ]
+    },
+    {
+      "board_slug": "health-assistant-board",
+      "key": "health-set-baselines",
+      "title": "Set weekly health baselines",
+      "description": "Set baseline targets for sleep, hydration, and activity.",
+      "status": "inbox",
+      "priority": "high",
+      "tag_slugs": [
+        "health",
+        "starter"
+      ]
+    },
+    {
+      "board_slug": "health-assistant-board",
+      "key": "health-design-checkin-ritual",
+      "title": "Design health check-in ritual",
+      "description": "Create a recurring weekly health review process.",
+      "status": "inbox",
+      "priority": "medium",
+      "tag_slugs": [
+        "health",
+        "starter"
+      ],
+      "depends_on_keys": [
+        "health-set-baselines"
+      ]
+    },
+    {
+      "board_slug": "wealth-maker-board",
+      "key": "wealth-define-watchlist-rules",
+      "title": "Define watchlist and risk rules",
+      "description": "Set thesis, position sizing, and risk guardrails.",
+      "status": "inbox",
+      "priority": "high",
+      "tag_slugs": [
+        "finance",
+        "starter"
+      ]
+    },
+    {
+      "board_slug": "wealth-maker-board",
+      "key": "wealth-build-weekly-review",
+      "title": "Build weekly portfolio review loop",
+      "description": "Track portfolio health, thesis updates, and next actions.",
+      "status": "inbox",
+      "priority": "medium",
+      "tag_slugs": [
+        "finance",
+        "starter"
+      ],
+      "depends_on_keys": [
+        "wealth-define-watchlist-rules"
+      ]
+    }
+  ]
+}

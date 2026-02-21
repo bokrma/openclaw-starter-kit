@@ -5,6 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
 SAFE_COMPOSE_TEMPLATE="$ROOT_DIR/docker-compose.safe.yml"
 COMPOSE_CMD=()
+OPENCLAW_AGENT_DEFINITIONS_DIR="$ROOT_DIR/openclaw-agents/agents"
+OPENCLAW_AGENT_MANIFEST_FILE="$OPENCLAW_AGENT_DEFINITIONS_DIR/manifest.json"
 
 log() {
   printf "\n[openclaw-easy] %s\n" "$*"
@@ -100,6 +102,117 @@ compose() {
   )
 }
 
+split_openclaw_agent_files() {
+  compose run --rm \
+    --volume "$ROOT_DIR:/work" \
+    --entrypoint node \
+    openclaw-cli /work/scripts/split_openclaw_agents.mjs \
+    --source-dir /work/openclaw-agents/agents \
+    --output-dir /work/openclaw-agents/agents \
+    --manifest /work/openclaw-agents/agents/manifest.json >/dev/null
+
+  [[ -f "$OPENCLAW_AGENT_MANIFEST_FILE" ]] || \
+    fail "Agent manifest was not generated: $OPENCLAW_AGENT_MANIFEST_FILE"
+}
+
+load_openclaw_agent_rows() {
+  local rows_script
+  rows_script="$(cat <<'NODE'
+import fs from "node:fs";
+
+const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
+const raw = fs.readFileSync(manifestPath, "utf8");
+const manifest = JSON.parse(raw);
+const agents = Array.isArray(manifest.agents) ? manifest.agents : [];
+for (const item of agents) {
+  const id = String(item?.id ?? "").trim();
+  if (!id) continue;
+  const name = String(item?.name ?? id).replace(/\|/g, "/").trim();
+  const workspace = String(
+    item?.workspace ?? `/home/node/.openclaw/workspace/agents/${id}`,
+  ).trim();
+  const isDefault = item?.default === true ? "true" : "false";
+  console.log(`${id}|${name}|${workspace}|${isDefault}`);
+}
+NODE
+)"
+
+  compose run --rm \
+    --volume "$ROOT_DIR:/work:ro" \
+    --entrypoint node \
+    -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
+    openclaw-cli --input-type=module -e "$rows_script"
+}
+
+configure_agents_from_manifest() {
+  local -a agent_rows=()
+  mapfile -t agent_rows < <(load_openclaw_agent_rows)
+  [[ "${#agent_rows[@]}" -gt 0 ]] || fail "No agents found in $OPENCLAW_AGENT_MANIFEST_FILE"
+
+  compose run --rm openclaw-cli config unset agents.list >/dev/null 2>&1 || true
+  local index=0
+  local row=""
+  local agent_id=""
+  local agent_name=""
+  local agent_workspace=""
+  local agent_is_default=""
+  for row in "${agent_rows[@]}"; do
+    IFS='|' read -r agent_id agent_name agent_workspace agent_is_default <<< "$row"
+    compose run --rm openclaw-cli config set "agents.list[$index].id" "$agent_id" >/dev/null 2>&1 || true
+    compose run --rm openclaw-cli config set "agents.list[$index].name" "$agent_name" >/dev/null 2>&1 || true
+    compose run --rm openclaw-cli config set "agents.list[$index].identity.name" "$agent_name" >/dev/null 2>&1 || true
+    compose run --rm openclaw-cli config set "agents.list[$index].workspace" "$agent_workspace" >/dev/null 2>&1 || true
+    if [[ "$agent_is_default" == "true" ]]; then
+      compose run --rm openclaw-cli config set "agents.list[$index].default" true >/dev/null 2>&1 || true
+      compose run --rm openclaw-cli config set "agents.list[$index].subagents.allowAgents[0]" "*" >/dev/null 2>&1 || true
+    fi
+    index=$((index + 1))
+  done
+}
+
+build_openclaw_agent_session_seed_json() {
+  local seed_script
+  seed_script="$(cat <<'NODE'
+import fs from "node:fs";
+
+const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
+const raw = fs.readFileSync(manifestPath, "utf8");
+const manifest = JSON.parse(raw);
+const agents = Array.isArray(manifest.agents) ? manifest.agents : [];
+const seed = [];
+for (const item of agents) {
+  const id = String(item?.id ?? "").trim();
+  if (!id) continue;
+  const name = String(item?.name ?? id).trim();
+  seed.push({ id, name });
+}
+console.log(JSON.stringify(seed));
+NODE
+)"
+
+  compose run --rm \
+    --volume "$ROOT_DIR:/work:ro" \
+    --entrypoint node \
+    -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
+    openclaw-cli --input-type=module -e "$seed_script"
+}
+
+sync_openclaw_agent_workspaces() {
+  compose run --rm \
+    --volume "$OPENCLAW_AGENT_DEFINITIONS_DIR:/tmp/openclaw-agent-defs:ro" \
+    --entrypoint sh \
+    openclaw-cli -lc '
+set -eu
+DEST=/home/node/.openclaw/workspace/agents
+mkdir -p "$DEST"
+find "$DEST" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+for src in /tmp/openclaw-agent-defs/*; do
+  [ -d "$src" ] || continue
+  cp -a "$src" "$DEST/"
+done
+'
+}
+
 default_dashboard_url() {
   local port
   port="${OPENCLAW_GATEWAY_PORT:-18789}"
@@ -137,13 +250,17 @@ ensure_dashboard_url_token() {
 log "Starting gateway"
 compose up -d openclaw-gateway
 
+log "Loading local agent specs from openclaw-agents/agents"
+split_openclaw_agent_files
+sync_openclaw_agent_workspaces
+configure_agents_from_manifest
+
 log "Reapplying gateway auth token"
 compose run --rm openclaw-cli config set gateway.mode local
 compose run --rm openclaw-cli config set gateway.auth.mode token
 compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN"
 compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json
 compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json
-compose run --rm openclaw-cli config set 'agents.list[0].subagents.allowAgents[0]' "*" >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config set tools.agentToAgent.enabled true --json >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config unset tools.agentToAgent.allow >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config set 'tools.agentToAgent.allow[0]' "*" >/dev/null 2>&1 || true
@@ -210,8 +327,11 @@ for (const req of list.pending ?? []) {
 console.log(JSON.stringify({ pending: (list.pending ?? []).length, approved }));
 ' || true
 
+session_seed_json="$(build_openclaw_agent_session_seed_json | tr -d '\r' | tail -n 1)"
+[[ -n "$session_seed_json" ]] || session_seed_json='[]'
+
 compose run --rm --entrypoint node \
-  -e OPENCLAW_AGENT_SESSION_SEED='[{"id":"main","name":"Jarvis"},{"id":"dev","name":"Dev Agent"},{"id":"backend","name":"Backend Engineer"},{"id":"frontend","name":"Frontend Engineer (React)"},{"id":"designer","name":"Designer"},{"id":"ux","name":"UI/UX Expert"},{"id":"db","name":"Database Engineer"},{"id":"pm","name":"PM Agent"},{"id":"qa","name":"QA Agent"},{"id":"research","name":"Research Agent"},{"id":"ops","name":"Ops Agent"},{"id":"growth","name":"Growth Agent"},{"id":"finance","name":"Financial Expert"},{"id":"stocks","name":"Stock Analyzer"},{"id":"creative","name":"Creative Agent"},{"id":"motivation","name":"Motivation Agent"}]' \
+  -e OPENCLAW_AGENT_SESSION_SEED="$session_seed_json" \
   openclaw-cli --input-type=module -e '
 import { loadConfig } from "/app/dist/config/config.js";
 import { updateSessionStore } from "/app/dist/config/sessions.js";

@@ -63,7 +63,7 @@ function Upsert-DotEnvValue {
         $out.Add($line)
     }
     $out.Add("$Key=$Value")
-    $out | Set-Content -Path $Path -Encoding ascii
+    Set-Content -Path $Path -Encoding ascii -Value @($out)
 }
 
 function New-HexToken {
@@ -266,8 +266,23 @@ console.log(JSON.stringify({ pending: (list.pending ?? []).length, approved }));
 }
 
 function Initialize-AgentMainSessions {
-    param([string]$OpenClawSrcDir)
-    $seedJson = '[{"id":"main","name":"Jarvis"},{"id":"dev","name":"Dev Agent"},{"id":"backend","name":"Backend Engineer"},{"id":"frontend","name":"Frontend Engineer (React)"},{"id":"designer","name":"Designer"},{"id":"ux","name":"UI/UX Expert"},{"id":"db","name":"Database Engineer"},{"id":"pm","name":"PM Agent"},{"id":"qa","name":"QA Agent"},{"id":"research","name":"Research Agent"},{"id":"ops","name":"Ops Agent"},{"id":"growth","name":"Growth Agent"},{"id":"finance","name":"Financial Expert"},{"id":"stocks","name":"Stock Analyzer"},{"id":"creative","name":"Creative Agent"},{"id":"motivation","name":"Motivation Agent"}]'
+    param(
+        [string]$OpenClawSrcDir,
+        [object[]]$AgentDefinitions
+    )
+    if (-not $AgentDefinitions -or $AgentDefinitions.Count -eq 0) {
+        return
+    }
+
+    $seed = @(
+        $AgentDefinitions | ForEach-Object {
+            [PSCustomObject]@{
+                id = $_.Id
+                name = $_.Name
+            }
+        }
+    )
+    $seedJson = $seed | ConvertTo-Json -Compress
     $nodeScript = @'
 import { loadConfig } from "/app/dist/config/config.js";
 import { updateSessionStore } from "/app/dist/config/sessions.js";
@@ -324,6 +339,116 @@ OPENCLAW_AGENT_SESSION_SEED="$(cat /tmp/openclaw-agent-session-seed.json)" node 
     ) -IgnoreExitCode | Out-Null
 }
 
+function Get-OpenClawAgentManifestPath {
+    param([string]$RootDir)
+    return Join-Path (Join-Path (Join-Path $RootDir "openclaw-agents") "agents") "manifest.json"
+}
+
+function Split-OpenClawAgentFiles {
+    param(
+        [string]$RootDir,
+        [string]$OpenClawSrcDir
+    )
+    $resolvedRoot = (Resolve-Path $RootDir).Path
+    $mountSpec = "${resolvedRoot}:/work"
+    Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @(
+        "run", "--rm",
+        "--volume", $mountSpec,
+        "--entrypoint", "node",
+        "openclaw-cli",
+        "/work/scripts/split_openclaw_agents.mjs",
+        "--source-dir", "/work/openclaw-agents/agents",
+        "--output-dir", "/work/openclaw-agents/agents",
+        "--manifest", "/work/openclaw-agents/agents/manifest.json"
+    ) | Out-Null
+
+    $manifestPath = Get-OpenClawAgentManifestPath -RootDir $RootDir
+    if (-not (Test-Path $manifestPath)) {
+        throw "Agent manifest was not generated: $manifestPath"
+    }
+}
+
+function Get-OpenClawAgentDefinitions {
+    param([string]$RootDir)
+    $manifestPath = Get-OpenClawAgentManifestPath -RootDir $RootDir
+    if (-not (Test-Path $manifestPath)) {
+        throw "Agent manifest missing: $manifestPath"
+    }
+    $rawManifest = Get-Content -Path $manifestPath -Raw
+    $manifest = $rawManifest | ConvertFrom-Json
+    $definitions = @()
+    foreach ($item in @($manifest.agents)) {
+        $id = "$($item.id)".Trim()
+        if ([string]::IsNullOrWhiteSpace($id)) {
+            continue
+        }
+        $name = "$($item.name)".Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $name = $id
+        }
+        $workspace = "$($item.workspace)".Trim()
+        if ([string]::IsNullOrWhiteSpace($workspace)) {
+            $workspace = "/home/node/.openclaw/workspace/agents/$id"
+        }
+        $definitions += [PSCustomObject]@{
+            Id = $id
+            Name = $name
+            Workspace = $workspace
+            IsDefault = [bool]$item.default
+        }
+    }
+
+    if ($definitions.Count -eq 0) {
+        throw "No agent definitions found in $manifestPath"
+    }
+
+    if (-not ($definitions | Where-Object { $_.IsDefault })) {
+        $main = $definitions | Where-Object { $_.Id -eq "main" } | Select-Object -First 1
+        if ($main) {
+            $main.IsDefault = $true
+        }
+        else {
+            $definitions[0].IsDefault = $true
+        }
+    }
+
+    return @(
+        $definitions | Sort-Object `
+            @{ Expression = { if ($_.IsDefault) { 0 } else { 1 } } }, `
+            @{ Expression = { $_.Id } }
+    )
+}
+
+function Sync-OpenClawAgentWorkspaces {
+    param(
+        [string]$RootDir,
+        [string]$OpenClawSrcDir
+    )
+    $splitDir = Join-Path (Join-Path $RootDir "openclaw-agents") "agents"
+    if (-not (Test-Path $splitDir)) {
+        throw "Split agent directory missing: $splitDir"
+    }
+    $resolvedSplitDir = (Resolve-Path $splitDir).Path
+    $mountSpec = "${resolvedSplitDir}:/tmp/openclaw-agent-defs:ro"
+    $copyScript = @'
+set -eu
+DEST=/home/node/.openclaw/workspace/agents
+mkdir -p "$DEST"
+find "$DEST" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+for src in /tmp/openclaw-agent-defs/*; do
+  [ -d "$src" ] || continue
+  cp -a "$src" "$DEST/"
+done
+'@
+    Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @(
+        "run", "--rm",
+        "--volume", $mountSpec,
+        "--entrypoint", "sh",
+        "openclaw-cli",
+        "-lc", $copyScript
+    ) | Out-Null
+}
+
 $RootDir = $PSScriptRoot
 $EnvFile = Join-Path $RootDir ".env"
 $SafeComposeTemplate = Join-Path $RootDir "docker-compose.safe.yml"
@@ -363,14 +488,20 @@ if (Test-Path $SafeComposeTemplate) {
 Write-Step "Starting gateway"
 Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @("up", "-d", "openclaw-gateway") | Out-Null
 
+Write-Step "Loading local agent specs from openclaw-agents/agents"
+Split-OpenClawAgentFiles -RootDir $RootDir -OpenClawSrcDir $OpenClawSrcDir
+$agentDefinitions = Get-OpenClawAgentDefinitions -RootDir $RootDir
+Sync-OpenClawAgentWorkspaces -RootDir $RootDir -OpenClawSrcDir $OpenClawSrcDir
+
 Write-Step "Reapplying gateway auth token"
-Invoke-OpenClawCliBatch -OpenClawSrcDir $OpenClawSrcDir -Lines @(
+$repairBatch = New-Object System.Collections.Generic.List[string]
+$repairBatch.AddRange(@(
     (New-OpenClawCliLine @("config", "set", "gateway.mode", "local")),
     (New-OpenClawCliLine @("config", "set", "gateway.auth.mode", "token")),
     (New-OpenClawCliLine @("config", "set", "gateway.auth.token", $env:OPENCLAW_GATEWAY_TOKEN)),
     (New-OpenClawCliLine @("config", "set", "gateway.controlUi.allowInsecureAuth", "true", "--json")),
     (New-OpenClawCliLine @("config", "set", "gateway.controlUi.dangerouslyDisableDeviceAuth", "true", "--json")),
-    (New-OpenClawCliLine @("config", "set", "agents.list[0].subagents.allowAgents[0]", "*")) + " || true",
+    (New-OpenClawCliLine @("config", "unset", "agents.list")) + " || true",
     (New-OpenClawCliLine @("config", "set", "tools.agentToAgent.enabled", "true", "--json")) + " || true",
     (New-OpenClawCliLine @("config", "unset", "tools.agentToAgent.allow")) + " || true",
     (New-OpenClawCliLine @("config", "set", "tools.agentToAgent.allow[0]", "*")) + " || true",
@@ -394,7 +525,19 @@ Invoke-OpenClawCliBatch -OpenClawSrcDir $OpenClawSrcDir -Lines @(
     (New-OpenClawCliLine @("config", "set", "browser.enabled", "true", "--json")) + " || true",
     (New-OpenClawCliLine @("config", "set", "browser.headless", "true", "--json")) + " || true",
     (New-OpenClawCliLine @("config", "set", "browser.noSandbox", "true", "--json")) + " || true"
-) -Quiet | Out-Null
+))
+for ($i = 0; $i -lt $agentDefinitions.Count; $i++) {
+    $agent = $agentDefinitions[$i]
+    $repairBatch.Add((New-OpenClawCliLine @("config", "set", "agents.list[$i].id", $agent.Id)) + " || true")
+    $repairBatch.Add((New-OpenClawCliLine @("config", "set", "agents.list[$i].name", $agent.Name)) + " || true")
+    $repairBatch.Add((New-OpenClawCliLine @("config", "set", "agents.list[$i].identity.name", $agent.Name)) + " || true")
+    $repairBatch.Add((New-OpenClawCliLine @("config", "set", "agents.list[$i].workspace", $agent.Workspace)) + " || true")
+    if ($agent.IsDefault) {
+        $repairBatch.Add((New-OpenClawCliLine @("config", "set", "agents.list[$i].default", "true")) + " || true")
+        $repairBatch.Add((New-OpenClawCliLine @("config", "set", "agents.list[$i].subagents.allowAgents[0]", "*")) + " || true")
+    }
+}
+Invoke-OpenClawCliBatch -OpenClawSrcDir $OpenClawSrcDir -Lines $repairBatch -Quiet | Out-Null
 Set-ExecApprovalMode -OpenClawSrcDir $OpenClawSrcDir -AlwaysAllowExec $alwaysAllowExec
 Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @(
     "run", "--rm", "--entrypoint", "sh", "openclaw-cli", "-lc",
@@ -405,7 +548,7 @@ Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @("run", "--rm", "op
 
 Write-Step "Repairing local device pairing state"
 Approve-LocalPendingDevicePairings -OpenClawSrcDir $OpenClawSrcDir
-Initialize-AgentMainSessions -OpenClawSrcDir $OpenClawSrcDir
+Initialize-AgentMainSessions -OpenClawSrcDir $OpenClawSrcDir -AgentDefinitions $agentDefinitions
 Invoke-Compose -OpenClawSrcDir $OpenClawSrcDir -ComposeArgs @("run", "--rm", "openclaw-cli", "memory", "index", "--agent", "main") -IgnoreExitCode | Out-Null
 
 Write-Step "Dashboard URL"

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MC_SEED_SCRIPT="$ROOT_DIR/scripts/mission_control/seed_starter_pack.py"
 
 assert_eq() {
   local expected="$1"
@@ -309,6 +310,11 @@ if ! grep -Fq 'OPENCLAW_MISSION_CONTROL_SEED_BOARD' "$ROOT_DIR/start.sh"; then
   exit 1
 fi
 
+if ! grep -Fq 'OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK' "$ROOT_DIR/start.sh"; then
+  echo "Assertion failed: start.sh should expose Mission Control board pack seed toggle" >&2
+  exit 1
+fi
+
 if ! grep -Fq 'OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_FILE' "$ROOT_DIR/start.sh"; then
   echo "Assertion failed: start.sh should expose Mission Control board config file env" >&2
   exit 1
@@ -316,6 +322,16 @@ fi
 
 if ! grep -Fq 'OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_JSON' "$ROOT_DIR/start.sh"; then
   echo "Assertion failed: start.sh should expose Mission Control board config json env" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE' "$ROOT_DIR/start.sh"; then
+  echo "Assertion failed: start.sh should expose Mission Control board pack config file env" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_JSON' "$ROOT_DIR/start.sh"; then
+  echo "Assertion failed: start.sh should expose Mission Control board pack config json env" >&2
   exit 1
 fi
 
@@ -474,8 +490,28 @@ if ! grep -Fq 'MC_BOARD_CONFIG_B64' "$ROOT_DIR/start.sh"; then
   exit 1
 fi
 
-if ! grep -Fq 'Perspective:\n' "$ROOT_DIR/start.sh"; then
-  echo "Assertion failed: start.sh should map perspective into board description" >&2
+if ! grep -Fq 'MC_BOARD_PACK_CONFIG_B64' "$ROOT_DIR/start.sh"; then
+  echo "Assertion failed: start.sh should pass board pack config JSON payload to Mission Control seed logic" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'scripts/mission_control/seed_starter_pack.py' "$ROOT_DIR/start.sh"; then
+  echo "Assertion failed: start.sh should execute shared Mission Control seed script" >&2
+  exit 1
+fi
+
+if [[ ! -f "$MC_SEED_SCRIPT" ]]; then
+  echo "Assertion failed: Mission Control seed script should exist" >&2
+  exit 1
+fi
+
+if ! grep -Fq '/boards' "$MC_SEED_SCRIPT"; then
+  echo "Assertion failed: Mission Control seed script should call boards API endpoints" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'Perspective:\n' "$MC_SEED_SCRIPT"; then
+  echo "Assertion failed: Mission Control seed script should map perspective into board description" >&2
   exit 1
 fi
 
@@ -544,7 +580,7 @@ if ! grep -Fq 'gateway.controlUi.dangerouslyDisableDeviceAuth true --json' "$ROO
   exit 1
 fi
 
-if ! grep -Fq 'agents.list[0].subagents.allowAgents[0]' "$ROOT_DIR/repair-auth.sh"; then
+if ! grep -Fq 'agents.list[$index].subagents.allowAgents[0]' "$ROOT_DIR/repair-auth.sh"; then
   echo "Assertion failed: repair-auth.sh should preserve Jarvis cross-agent orchestration" >&2
   exit 1
 fi

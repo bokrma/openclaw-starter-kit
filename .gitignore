@@ -1,4 +1,5 @@
 .env
+.envbackup
 vendor/
 .tmp-openclaw-command-center/
 .tmp-openclaw-mission-control/
