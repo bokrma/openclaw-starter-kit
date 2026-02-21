@@ -266,18 +266,36 @@ if [[ -z "$browser_probe" || "$browser_probe" != profiles=* ]]; then
   fail "Browser control service probe failed: ${browser_probe:-unknown}"
 fi
 
+agent_manifest_json="$(compose run --rm --volume "$ROOT_DIR:/work:ro" --entrypoint node openclaw-cli --input-type=module -e '
+import fs from "node:fs";
+
+const raw = fs.readFileSync("/work/openclaw-agents/agents/manifest.json", "utf8");
+const manifest = JSON.parse(raw);
+const agents = Array.isArray(manifest.agents) ? manifest.agents : [];
+const compact = agents.map((item) => ({
+  id: String(item?.id ?? "").trim(),
+  name: String(item?.name ?? "").trim(),
+  default: item?.default === true,
+}));
+console.log(JSON.stringify(compact));
+' 2>/dev/null | tr -d '\r' | tail -n 1)"
+if [[ -z "$agent_manifest_json" ]]; then
+  fail "Agent manifest is missing or unreadable: $ROOT_DIR/openclaw-agents/agents/manifest.json"
+fi
+
 log "Checking agent pack + coordinator wiring"
-compose run --rm --entrypoint node openclaw-cli --input-type=module -e '
+compose run --rm --entrypoint node -e OPENCLAW_AGENT_MANIFEST="$agent_manifest_json" openclaw-cli --input-type=module -e '
 import { loadConfig } from "/app/dist/config/config.js";
 import { loadSessionStore } from "/app/dist/config/sessions.js";
 import { resolveAgentMainSessionKey } from "/app/dist/config/sessions/main-session.js";
 import { resolveGatewaySessionStoreTarget } from "/app/dist/gateway/session-utils.js";
 import { normalizeAgentId } from "/app/dist/routing/session-key.js";
 
-const required = [
-  "main", "dev", "backend", "frontend", "designer", "ux", "db", "pm",
-  "qa", "research", "ops", "growth", "finance", "stocks", "creative", "motivation",
-];
+const manifestAgentsRaw = JSON.parse(process.env.OPENCLAW_AGENT_MANIFEST ?? "[]");
+const manifestAgents = Array.isArray(manifestAgentsRaw) ? manifestAgentsRaw : [];
+const required = manifestAgents
+  .map((item) => normalizeAgentId(String(item?.id ?? "")))
+  .filter((id) => Boolean(id));
 
 const cfg = loadConfig();
 const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
@@ -289,6 +307,9 @@ for (const entry of agents) {
 }
 
 const issues = [];
+if (required.length === 0) {
+  issues.push("agent manifest is empty; expected at least one agent");
+}
 const missingAgents = required.filter((id) => !byId.has(id));
 if (missingAgents.length > 0) {
   issues.push(`missing agents: ${missingAgents.join(", ")}`);
@@ -296,8 +317,14 @@ if (missingAgents.length > 0) {
 
 const main = byId.get("main");
 const mainName = String(main?.name ?? "").trim();
-if (mainName !== "Jarvis") {
-  issues.push(`main agent name should be Jarvis (found: ${mainName || "<empty>"})`);
+const defaultManifestAgent =
+  manifestAgents.find((item) => item?.default === true) ??
+  manifestAgents.find((item) => normalizeAgentId(String(item?.id ?? "")) === "main");
+const expectedMainName = String(defaultManifestAgent?.name ?? "Jarvis").trim();
+if (mainName !== expectedMainName) {
+  issues.push(
+    `main agent name should be ${expectedMainName || "Jarvis"} (found: ${mainName || "<empty>"})`,
+  );
 }
 const allowAgents = Array.isArray(main?.subagents?.allowAgents)
   ? main.subagents.allowAgents.map((value) => String(value).trim())

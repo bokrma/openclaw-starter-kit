@@ -7,6 +7,8 @@ ENV_EXAMPLE_FILE="$ROOT_DIR/.env.example"
 SAFE_COMPOSE_TEMPLATE="$ROOT_DIR/docker-compose.safe.yml"
 COMPOSE_CMD=()
 COMPOSE_HINT=""
+OPENCLAW_AGENT_DEFINITIONS_DIR="$ROOT_DIR/openclaw-agents/agents"
+OPENCLAW_AGENT_MANIFEST_FILE="$OPENCLAW_AGENT_DEFINITIONS_DIR/manifest.json"
 
 log() {
   printf "\n[openclaw-easy] %s\n" "$*"
@@ -862,6 +864,36 @@ mission_control_http_200() {
   [[ "$code" == "200" ]]
 }
 
+sync_mission_control_db_password() {
+  local db_user="${OPENCLAW_MISSION_CONTROL_POSTGRES_USER:-postgres}"
+  local db_password="${OPENCLAW_MISSION_CONTROL_POSTGRES_PASSWORD:-}"
+  [[ -n "$db_password" ]] || return 0
+  local escaped_password
+  escaped_password="${db_password//\'/\'\'}"
+  mission_control_compose exec -T -u postgres db \
+    psql -d postgres -v ON_ERROR_STOP=1 \
+    -c "ALTER USER \"$db_user\" WITH PASSWORD '$escaped_password';" >/dev/null 2>&1 || true
+}
+
+mission_control_backend_ready() {
+  local backend_url="${1:-}"
+  local token="${2:-}"
+  [[ -n "$backend_url" && -n "$token" ]] || return 1
+
+  local health_code
+  health_code="$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "${backend_url}/health" || true)"
+  if [[ "$health_code" != "200" ]]; then
+    return 1
+  fi
+
+  local auth_code
+  auth_code="$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 \
+    -X POST \
+    -H "Authorization: Bearer ${token}" \
+    "${backend_url}/api/v1/auth/bootstrap" || true)"
+  [[ "$auth_code" == "200" ]]
+}
+
 command_center_compose() {
   (
     cd "$ROOT_DIR"
@@ -877,25 +909,95 @@ command_center_http_200() {
   [[ "$code" == "200" ]]
 }
 
+split_openclaw_agent_files() {
+  compose run --rm \
+    --volume "$ROOT_DIR:/work" \
+    --entrypoint node \
+    openclaw-cli /work/scripts/split_openclaw_agents.mjs \
+    --source-dir /work/openclaw-agents/agents \
+    --output-dir /work/openclaw-agents/agents \
+    --manifest /work/openclaw-agents/agents/manifest.json >/dev/null
+
+  [[ -f "$OPENCLAW_AGENT_MANIFEST_FILE" ]] || \
+    fail "Agent manifest was not generated: $OPENCLAW_AGENT_MANIFEST_FILE"
+}
+
+load_openclaw_agent_rows() {
+  local rows_script
+  rows_script="$(cat <<'NODE'
+import fs from "node:fs";
+
+const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
+const raw = fs.readFileSync(manifestPath, "utf8");
+const manifest = JSON.parse(raw);
+const agents = Array.isArray(manifest.agents) ? manifest.agents : [];
+for (const item of agents) {
+  const id = String(item?.id ?? "").trim();
+  if (!id) continue;
+  const name = String(item?.name ?? id).replace(/\|/g, "/").trim();
+  const workspace = String(
+    item?.workspace ?? `/home/node/.openclaw/workspace/agents/${id}`,
+  ).trim();
+  const isDefault = item?.default === true ? "true" : "false";
+  console.log(`${id}|${name}|${workspace}|${isDefault}`);
+}
+NODE
+)"
+
+  compose run --rm \
+    --volume "$ROOT_DIR:/work:ro" \
+    --entrypoint node \
+    -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
+    openclaw-cli --input-type=module -e "$rows_script"
+}
+
+build_openclaw_agent_session_seed_json() {
+  local seed_script
+  seed_script="$(cat <<'NODE'
+import fs from "node:fs";
+
+const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
+const raw = fs.readFileSync(manifestPath, "utf8");
+const manifest = JSON.parse(raw);
+const agents = Array.isArray(manifest.agents) ? manifest.agents : [];
+const seed = [];
+for (const item of agents) {
+  const id = String(item?.id ?? "").trim();
+  if (!id) continue;
+  const name = String(item?.name ?? id).trim();
+  seed.push({ id, name });
+}
+console.log(JSON.stringify(seed));
+NODE
+)"
+
+  compose run --rm \
+    --volume "$ROOT_DIR:/work:ro" \
+    --entrypoint node \
+    -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
+    openclaw-cli --input-type=module -e "$seed_script"
+}
+
+sync_openclaw_agent_workspaces() {
+  compose run --rm \
+    --volume "$OPENCLAW_AGENT_DEFINITIONS_DIR:/tmp/openclaw-agent-defs:ro" \
+    --entrypoint sh \
+    openclaw-cli -lc '
+set -eu
+DEST=/home/node/.openclaw/workspace/agents
+mkdir -p "$DEST"
+find "$DEST" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} +
+for src in /tmp/openclaw-agent-defs/*; do
+  [ -d "$src" ] || continue
+  cp -a "$src" "$DEST/"
+done
+'
+}
+
 configure_agents() {
-  local -a agent_rows=(
-    "main|Jarvis"
-    "dev|Dev Agent"
-    "backend|Backend Engineer"
-    "frontend|Frontend Engineer (React)"
-    "designer|Designer"
-    "ux|UI/UX Expert"
-    "db|Database Engineer"
-    "pm|PM Agent"
-    "qa|QA Agent"
-    "research|Research Agent"
-    "ops|Ops Agent"
-    "growth|Growth Agent"
-    "finance|Financial Expert"
-    "stocks|Stock Analyzer"
-    "creative|Creative Agent"
-    "motivation|Motivation Agent"
-  )
+  local -a agent_rows=()
+  mapfile -t agent_rows < <(load_openclaw_agent_rows)
+  [[ "${#agent_rows[@]}" -gt 0 ]] || fail "No agents found in $OPENCLAW_AGENT_MANIFEST_FILE"
 
   compose run --rm openclaw-cli config set agents.defaults.model.primary openai/gpt-5.2
   compose run --rm openclaw-cli config unset agents.defaults.model.fallbacks >/dev/null 2>&1 || true
@@ -906,13 +1008,15 @@ configure_agents() {
   local row=""
   local agent_id=""
   local agent_name=""
+  local agent_workspace=""
+  local agent_is_default=""
   for row in "${agent_rows[@]}"; do
-    agent_id="${row%%|*}"
-    agent_name="${row#*|}"
+    IFS='|' read -r agent_id agent_name agent_workspace agent_is_default <<< "$row"
     compose run --rm openclaw-cli config set "agents.list[$index].id" "$agent_id"
     compose run --rm openclaw-cli config set "agents.list[$index].name" "$agent_name"
     compose run --rm openclaw-cli config set "agents.list[$index].identity.name" "$agent_name"
-    if [[ "$index" -eq 0 ]]; then
+    compose run --rm openclaw-cli config set "agents.list[$index].workspace" "$agent_workspace"
+    if [[ "$agent_is_default" == "true" ]]; then
       compose run --rm openclaw-cli config set "agents.list[$index].default" true
       compose run --rm openclaw-cli config set "agents.list[$index].subagents.allowAgents[0]" "*"
     fi
@@ -962,8 +1066,12 @@ sync_exec_approvals_mode() {
 }
 
 bootstrap_agent_main_sessions() {
+  local session_seed_json
+  session_seed_json="$(build_openclaw_agent_session_seed_json | tr -d '\r' | tail -n 1)"
+  [[ -n "$session_seed_json" ]] || session_seed_json="[]"
+
   compose run --rm --entrypoint node \
-    -e OPENCLAW_AGENT_SESSION_SEED='[{"id":"main","name":"Jarvis"},{"id":"dev","name":"Dev Agent"},{"id":"backend","name":"Backend Engineer"},{"id":"frontend","name":"Frontend Engineer (React)"},{"id":"designer","name":"Designer"},{"id":"ux","name":"UI/UX Expert"},{"id":"db","name":"Database Engineer"},{"id":"pm","name":"PM Agent"},{"id":"qa","name":"QA Agent"},{"id":"research","name":"Research Agent"},{"id":"ops","name":"Ops Agent"},{"id":"growth","name":"Growth Agent"},{"id":"finance","name":"Financial Expert"},{"id":"stocks","name":"Stock Analyzer"},{"id":"creative","name":"Creative Agent"},{"id":"motivation","name":"Motivation Agent"}]' \
+    -e OPENCLAW_AGENT_SESSION_SEED="$session_seed_json" \
     openclaw-cli --input-type=module -e '
 import { loadConfig } from "/app/dist/config/config.js";
 import { updateSessionStore } from "/app/dist/config/sessions.js";
@@ -1065,6 +1173,7 @@ main() {
   fi
   export OPENCLAW_MISSION_CONTROL_AUTOCONFIG_GATEWAY="${OPENCLAW_MISSION_CONTROL_AUTOCONFIG_GATEWAY:-true}"
   export OPENCLAW_MISSION_CONTROL_SYNC_TEMPLATES="${OPENCLAW_MISSION_CONTROL_SYNC_TEMPLATES:-true}"
+  export OPENCLAW_MISSION_CONTROL_SYNC_MANIFEST_AGENTS="${OPENCLAW_MISSION_CONTROL_SYNC_MANIFEST_AGENTS:-true}"
   export OPENCLAW_MISSION_CONTROL_GATEWAY_NAME="${OPENCLAW_MISSION_CONTROL_GATEWAY_NAME:-OpenClaw Docker Gateway}"
   export OPENCLAW_MISSION_CONTROL_GATEWAY_WORKSPACE_ROOT="${OPENCLAW_MISSION_CONTROL_GATEWAY_WORKSPACE_ROOT:-/home/node/.openclaw}"
   export OPENCLAW_MISSION_CONTROL_GATEWAY_ID="${OPENCLAW_MISSION_CONTROL_GATEWAY_ID:-}"
@@ -1083,8 +1192,13 @@ main() {
   export OPENCLAW_MISSION_CONTROL_BOARD_GOAL_SOURCE="${OPENCLAW_MISSION_CONTROL_BOARD_GOAL_SOURCE:-}"
   export OPENCLAW_MISSION_CONTROL_BOARD_GROUP_ID="${OPENCLAW_MISSION_CONTROL_BOARD_GROUP_ID:-}"
   export OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS="${OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS:-1}"
+  export OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID="${OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID:-}"
+  export OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_SLUG="${OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_SLUG:-$OPENCLAW_MISSION_CONTROL_BOARD_SLUG}"
   export OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_JSON="${OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_JSON:-}"
   export OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_FILE="${OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_FILE:-}"
+  export OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK="${OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK:-false}"
+  export OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_JSON="${OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_JSON:-}"
+  export OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE="${OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE:-}"
   export OPENCLAW_COMMAND_CENTER_REPO_URL="${OPENCLAW_COMMAND_CENTER_REPO_URL:-https://github.com/jontsai/openclaw-command-center.git}"
   upsert_env "$ENV_FILE" "OPENCLAW_COMMAND_CENTER_REPO_URL" "$OPENCLAW_COMMAND_CENTER_REPO_URL"
   export OPENCLAW_COMMAND_CENTER_REPO_BRANCH="${OPENCLAW_COMMAND_CENTER_REPO_BRANCH:-main}"
@@ -1162,6 +1276,7 @@ main() {
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_POSTGRES_PASSWORD" "$OPENCLAW_MISSION_CONTROL_POSTGRES_PASSWORD"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_AUTOCONFIG_GATEWAY" "$OPENCLAW_MISSION_CONTROL_AUTOCONFIG_GATEWAY"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_SYNC_TEMPLATES" "$OPENCLAW_MISSION_CONTROL_SYNC_TEMPLATES"
+  upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_SYNC_MANIFEST_AGENTS" "$OPENCLAW_MISSION_CONTROL_SYNC_MANIFEST_AGENTS"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_GATEWAY_NAME" "$OPENCLAW_MISSION_CONTROL_GATEWAY_NAME"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_GATEWAY_WORKSPACE_ROOT" "$OPENCLAW_MISSION_CONTROL_GATEWAY_WORKSPACE_ROOT"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_GATEWAY_ID" "$OPENCLAW_MISSION_CONTROL_GATEWAY_ID"
@@ -1180,8 +1295,13 @@ main() {
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_GOAL_SOURCE" "$OPENCLAW_MISSION_CONTROL_BOARD_GOAL_SOURCE"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_GROUP_ID" "$OPENCLAW_MISSION_CONTROL_BOARD_GROUP_ID"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS" "$OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS"
+  upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID" "$OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID"
+  upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_SLUG" "$OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_SLUG"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_JSON" "$OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_JSON"
   upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_FILE" "$OPENCLAW_MISSION_CONTROL_BOARD_CONFIG_FILE"
+  upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK" "$OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK"
+  upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_JSON" "$OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_JSON"
+  upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE" "$OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE"
   upsert_env "$ENV_FILE" "OPENCLAW_COMMAND_CENTER_PORT" "$OPENCLAW_COMMAND_CENTER_PORT"
   upsert_env "$ENV_FILE" "OPENCLAW_COMMAND_CENTER_AUTH_MODE" "$OPENCLAW_COMMAND_CENTER_AUTH_MODE"
   upsert_env "$ENV_FILE" "OPENCLAW_COMMAND_CENTER_TOKEN" "$OPENCLAW_COMMAND_CENTER_TOKEN"
@@ -1265,6 +1385,10 @@ main() {
   compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN"
   compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json
   compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json
+
+  log "Loading local agent specs from openclaw-agents/agents"
+  split_openclaw_agent_files
+  sync_openclaw_agent_workspaces
 
   log "Applying defaults (CLI backends, concurrency, agent pack)"
   compose run --rm openclaw-cli config set "agents.defaults.cliBackends[claude-cli].command" "/home/node/.openclaw/tools/bin/claude"
@@ -1515,6 +1639,7 @@ chmod +x "$TOOLS_DIR/bin/openclaw" "$TOOLS_DIR/bin/agent-browser" || true
   mission_control_registered_gateway_url=""
   mission_control_registered_gateway_id=""
   mission_control_seed_board_summary=""
+  mission_control_seed_board_id=""
   command_center_dashboard_url=""
   if is_truthy "${OPENCLAW_ENABLE_MISSION_CONTROL}"; then
     clone_or_update_mission_control
@@ -1570,6 +1695,8 @@ chmod +x "$TOOLS_DIR/bin/openclaw" "$TOOLS_DIR/bin/agent-browser" || true
 
     log "Starting Mission Control"
     mission_control_compose up -d --build
+    sync_mission_control_db_password
+    mission_control_compose up -d backend >/dev/null 2>&1 || true
 
     log "Mission Control health check"
     mission_control_ready=false
@@ -1588,6 +1715,24 @@ chmod +x "$TOOLS_DIR/bin/openclaw" "$TOOLS_DIR/bin/agent-browser" || true
       printf "[openclaw-easy] Mission Control logs (backend, frontend; last 120 lines):\n"
       mission_control_compose logs --tail=120 backend frontend || true
       fail "Mission Control health check failed (expected HTTP 200 at ${mission_control_frontend_url}/)."
+    fi
+
+    mission_control_backend_ready_flag=false
+    for attempt in $(seq 1 45); do
+      if mission_control_backend_ready "$mission_control_backend_url" "$OPENCLAW_MISSION_CONTROL_LOCAL_AUTH_TOKEN"; then
+        mission_control_backend_ready_flag=true
+        break
+      fi
+      if [[ "$attempt" -eq 1 || $((attempt % 10)) -eq 0 ]]; then
+        printf "[openclaw-easy] waiting for Mission Control backend %s (attempt %s/45)\n" "$mission_control_backend_url" "$attempt"
+        mission_control_compose ps || true
+      fi
+      sleep 2
+    done
+    if [[ "$mission_control_backend_ready_flag" != "true" ]]; then
+      printf "[openclaw-easy] Mission Control backend logs (last 120 lines):\n"
+      mission_control_compose logs --tail=120 backend || true
+      fail "Mission Control backend is unreachable for auth bootstrap at ${mission_control_backend_url}/api/v1/auth/bootstrap."
     fi
 
     openclaw_network_name="${COMPOSE_PROJECT_NAME}_openclaw-safe-net"
@@ -1809,13 +1954,114 @@ PY
       board_config_b64="$(printf "%s" "$board_config_json" | base64 | tr -d '\r\n')"
     fi
 
+    board_pack_config_json="${OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_JSON:-}"
+    if [[ -z "$board_pack_config_json" && -n "${OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE:-}" ]]; then
+      board_pack_config_path="${OPENCLAW_MISSION_CONTROL_BOARD_PACK_CONFIG_FILE}"
+      if [[ ! "$board_pack_config_path" = /* && ! "$board_pack_config_path" =~ ^[A-Za-z]:[\\/].* ]]; then
+        board_pack_config_path="$ROOT_DIR/$board_pack_config_path"
+      fi
+      if [[ -f "$board_pack_config_path" ]]; then
+        board_pack_config_json="$(cat "$board_pack_config_path")"
+      else
+        printf "[openclaw-easy] Mission Control board pack config file not found: %s (continuing with env values).\n" "$board_pack_config_path"
+      fi
+    fi
+    board_pack_config_b64=""
+    if [[ -n "$board_pack_config_json" ]]; then
+      board_pack_config_b64="$(printf "%s" "$board_pack_config_json" | base64 | tr -d '\r\n')"
+    fi
+
+    should_seed_mission_control_board="false"
     if is_truthy "${OPENCLAW_MISSION_CONTROL_SEED_BOARD}"; then
+      should_seed_mission_control_board="true"
+    fi
+    if is_truthy "${OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK}"; then
+      should_seed_mission_control_board="true"
+    fi
+    if [[ -n "$board_pack_config_b64" ]]; then
+      should_seed_mission_control_board="true"
+    fi
+
+    if [[ "$should_seed_mission_control_board" == "true" ]]; then
       log "Mission Control board seed"
-      read -r -d '' mc_board_seed_script <<'PY' || true
+      mc_board_seed_script_path="$ROOT_DIR/scripts/mission_control/seed_starter_pack.py"
+      if [[ ! -f "$mc_board_seed_script_path" ]]; then
+        printf "[openclaw-easy] Mission Control board seed script missing: %s (continuing).\n" "$mc_board_seed_script_path"
+      else
+        mc_board_seed_script="$(cat "$mc_board_seed_script_path")"
+        board_seed_output=""
+        if ! board_seed_output="$(
+          printf "%s" "$mc_board_seed_script" | mission_control_compose exec -T \
+            -e "MC_TOKEN=${OPENCLAW_MISSION_CONTROL_LOCAL_AUTH_TOKEN}" \
+            -e "MC_GATEWAY_ID=${mission_control_registered_gateway_id}" \
+            -e "MC_GATEWAY_NAME=${OPENCLAW_MISSION_CONTROL_GATEWAY_NAME}" \
+            -e "MC_GATEWAY_URL=${OPENCLAW_MISSION_CONTROL_GATEWAY_URL}" \
+            -e "MC_BOARD_NAME=${OPENCLAW_MISSION_CONTROL_BOARD_NAME}" \
+            -e "MC_BOARD_SLUG=${OPENCLAW_MISSION_CONTROL_BOARD_SLUG}" \
+            -e "MC_BOARD_DESCRIPTION=${OPENCLAW_MISSION_CONTROL_BOARD_DESCRIPTION}" \
+            -e "MC_BOARD_PERSPECTIVE=${OPENCLAW_MISSION_CONTROL_BOARD_PERSPECTIVE}" \
+            -e "MC_BOARD_TYPE=${OPENCLAW_MISSION_CONTROL_BOARD_TYPE}" \
+            -e "MC_BOARD_OBJECTIVE=${OPENCLAW_MISSION_CONTROL_BOARD_OBJECTIVE}" \
+            -e "MC_BOARD_SUCCESS_METRICS_JSON=${OPENCLAW_MISSION_CONTROL_BOARD_SUCCESS_METRICS_JSON}" \
+            -e "MC_BOARD_TARGET_DATE=${OPENCLAW_MISSION_CONTROL_BOARD_TARGET_DATE}" \
+            -e "MC_BOARD_GOAL_CONFIRMED=${OPENCLAW_MISSION_CONTROL_BOARD_GOAL_CONFIRMED}" \
+            -e "MC_BOARD_GOAL_SOURCE=${OPENCLAW_MISSION_CONTROL_BOARD_GOAL_SOURCE}" \
+            -e "MC_BOARD_GROUP_ID=${OPENCLAW_MISSION_CONTROL_BOARD_GROUP_ID}" \
+            -e "MC_BOARD_MAX_AGENTS=${OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS}" \
+            -e "MC_BOARD_CONFIG_B64=${board_config_b64}" \
+            -e "MC_SEED_BOARD=${OPENCLAW_MISSION_CONTROL_SEED_BOARD}" \
+            -e "MC_SEED_BOARD_PACK=${OPENCLAW_MISSION_CONTROL_SEED_BOARD_PACK}" \
+            -e "MC_BOARD_PACK_CONFIG_B64=${board_pack_config_b64}" \
+            backend python - 2>&1
+        )"; then
+          printf "[openclaw-easy] Mission Control board seed failed (continuing).\n"
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            printf "[openclaw-easy] mission-control-board: %s\n" "$line"
+          done <<<"$board_seed_output"
+        else
+          board_action=""
+          board_id=""
+          board_name=""
+          board_slug=""
+          board_seed_summary_b64=""
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            if [[ "$line" == MISSION_CONTROL_BOARD_ACTION=* ]]; then
+              board_action="${line#MISSION_CONTROL_BOARD_ACTION=}"
+            elif [[ "$line" == MISSION_CONTROL_BOARD_ID=* ]]; then
+              board_id="${line#MISSION_CONTROL_BOARD_ID=}"
+            elif [[ "$line" == MISSION_CONTROL_BOARD_NAME=* ]]; then
+              board_name="${line#MISSION_CONTROL_BOARD_NAME=}"
+            elif [[ "$line" == MISSION_CONTROL_BOARD_SLUG=* ]]; then
+              board_slug="${line#MISSION_CONTROL_BOARD_SLUG=}"
+            elif [[ "$line" == MISSION_CONTROL_SEED_SUMMARY_B64=* ]]; then
+              board_seed_summary_b64="${line#MISSION_CONTROL_SEED_SUMMARY_B64=}"
+            fi
+            printf "[openclaw-easy] mission-control-board: %s\n" "$line"
+          done <<<"$board_seed_output"
+          if [[ -n "$board_action" || -n "$board_name" ]]; then
+            mission_control_seed_board_summary="action=$board_action name=$board_name slug=$board_slug id=$board_id"
+            if [[ -n "$board_id" ]]; then
+              mission_control_seed_board_id="$board_id"
+            fi
+          elif [[ -n "$board_seed_summary_b64" ]]; then
+            mission_control_seed_board_summary="starter pack seed completed"
+          fi
+        fi
+      fi
+    fi
+    if is_truthy "${OPENCLAW_MISSION_CONTROL_SYNC_MANIFEST_AGENTS}"; then
+      log "Mission Control manifest agent sync"
+      manifest_agents_json="$(build_openclaw_agent_session_seed_json | tr -d '\r' | tail -n 1)"
+      if [[ -z "$manifest_agents_json" ]]; then
+        manifest_agents_json="[]"
+      fi
+      manifest_agents_b64="$(printf "%s" "$manifest_agents_json" | base64 | tr -d '\r\n')"
+      read -r -d '' mc_manifest_agent_sync_script <<'PY' || true
 import base64
 import json
 import os
-import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1825,7 +2071,10 @@ token = (os.environ.get("MC_TOKEN") or "").strip()
 gateway_id_hint = (os.environ.get("MC_GATEWAY_ID") or "").strip()
 gateway_name_hint = (os.environ.get("MC_GATEWAY_NAME") or "").strip()
 gateway_url_hint = (os.environ.get("MC_GATEWAY_URL") or "").strip()
-config_b64 = (os.environ.get("MC_BOARD_CONFIG_B64") or "").strip()
+target_board_id_hint = (os.environ.get("MC_TARGET_BOARD_ID") or "").strip()
+target_board_slug_hint = (os.environ.get("MC_TARGET_BOARD_SLUG") or "").strip()
+seeded_board_id_hint = (os.environ.get("MC_SEEDED_BOARD_ID") or "").strip()
+manifest_agents_b64 = (os.environ.get("MC_MANIFEST_AGENTS_B64") or "").strip()
 
 if not token:
     raise RuntimeError("mission control auth token is empty")
@@ -1834,6 +2083,7 @@ headers = {
     "Authorization": f"Bearer {token}",
     "Content-Type": "application/json",
 }
+
 
 def request_json(method, path, *, query=None, payload=None):
     url = f"{base}{path}"
@@ -1844,7 +2094,7 @@ def request_json(method, path, *, query=None, payload=None):
         data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
             parsed = json.loads(raw) if raw else {}
             return resp.getcode(), parsed
@@ -1853,223 +2103,265 @@ def request_json(method, path, *, query=None, payload=None):
         detail = raw.strip() or exc.reason
         raise RuntimeError(f"{method} {path} failed ({exc.code}): {detail}") from exc
 
-def parse_bool(raw, default=False):
-    if raw is None:
-        return default
-    if isinstance(raw, bool):
-        return raw
-    text = str(raw).strip().lower()
-    if text == "":
-        return default
-    return text in {"1", "true", "yes", "on"}
 
-def parse_int(raw, default):
-    if raw is None:
-        return default
-    if isinstance(raw, int):
-        return raw
-    text = str(raw).strip()
-    if text == "":
-        return default
-    try:
-        return int(text)
-    except ValueError:
-        return default
+def fetch_all(path, *, query=None, limit=200):
+    merged_query = dict(query or {})
+    offset = 0
+    items = []
+    while True:
+        page_query = dict(merged_query)
+        page_query["limit"] = str(limit)
+        page_query["offset"] = str(offset)
+        _, payload = request_json("GET", path, query=page_query)
+        page_items = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(page_items, list):
+            page_items = []
+        normalized = [item for item in page_items if isinstance(item, dict)]
+        items.extend(normalized)
+        if len(normalized) < limit:
+            break
+        offset += limit
+    return items
 
-def slugify(value):
-    normalized = re.sub(r"[^a-z0-9]+", "-", (value or "").strip().lower()).strip("-")
-    return normalized or "main-board"
 
-config = {}
-if config_b64:
-    try:
-        decoded = base64.b64decode(config_b64).decode("utf-8")
-        parsed = json.loads(decoded)
-    except Exception as exc:
-        raise RuntimeError(f"invalid board config JSON: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise RuntimeError("board config JSON must be an object")
-    config = parsed
-
-def cfg(key, env_key, default=None):
-    if key in config and config[key] is not None:
-        return config[key]
-    value = os.environ.get(env_key)
-    if value is not None and value.strip() != "":
-        return value.strip()
-    return default
-
-request_json("POST", "/auth/bootstrap")
-_, gateways_payload = request_json("GET", "/gateways", query={"limit": "200", "offset": "0"})
-gateways = gateways_payload.get("items") if isinstance(gateways_payload, dict) else []
-if not isinstance(gateways, list):
-    gateways = []
-
-gateway_id = cfg("gateway_id", "MC_GATEWAY_ID", gateway_id_hint)
-if gateway_id:
-    gateway_id = str(gateway_id).strip()
-if not gateway_id:
-    selected_gateway = None
-    for item in gateways:
+def parse_manifest_agents(raw_b64):
+    if not raw_b64:
+        return []
+    padded = raw_b64 + ("=" * (-len(raw_b64) % 4))
+    decoded = base64.b64decode(padded.encode("utf-8")).decode("utf-8")
+    parsed = json.loads(decoded)
+    if not isinstance(parsed, list):
+        return []
+    agents = []
+    for item in parsed:
         if not isinstance(item, dict):
             continue
-        if gateway_url_hint and item.get("url") == gateway_url_hint:
-            selected_gateway = item
-            break
-        if gateway_name_hint and item.get("name") == gateway_name_hint:
-            selected_gateway = item
-            break
-    if selected_gateway is None and gateways:
-        selected_gateway = gateways[0]
-    if selected_gateway is not None:
-        gateway_id = str(selected_gateway.get("id") or "").strip()
+        agent_id = str(item.get("id") or "").strip()
+        if not agent_id:
+            continue
+        name = str(item.get("name") or agent_id).strip() or agent_id
+        agents.append({"id": agent_id, "name": name})
+    return agents
 
+
+def parse_int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def pick_gateway(gateways):
+    if gateway_id_hint:
+        for item in gateways:
+            if str(item.get("id") or "").strip() == gateway_id_hint:
+                return item
+    for item in gateways:
+        if gateway_name_hint and str(item.get("name") or "").strip() == gateway_name_hint:
+            return item
+        if gateway_url_hint and str(item.get("url") or "").strip() == gateway_url_hint:
+            return item
+    return gateways[0] if gateways else None
+
+
+def pick_board(all_boards, gateway_id):
+    if target_board_id_hint:
+        for board in all_boards:
+            if str(board.get("id") or "").strip() == target_board_id_hint:
+                return board
+    if seeded_board_id_hint:
+        for board in all_boards:
+            if str(board.get("id") or "").strip() == seeded_board_id_hint:
+                return board
+    gateway_boards = [
+        board
+        for board in all_boards
+        if str(board.get("gateway_id") or "").strip() == gateway_id
+    ]
+    if target_board_slug_hint:
+        for board in gateway_boards:
+            if str(board.get("slug") or "").strip() == target_board_slug_hint:
+                return board
+    return gateway_boards[0] if gateway_boards else None
+
+
+def normalize_identity_profile(existing_profile, manifest_id, manifest_name):
+    merged = {}
+    if isinstance(existing_profile, dict):
+        for raw_key, raw_value in existing_profile.items():
+            key = str(raw_key).strip()
+            if not key or raw_value is None:
+                continue
+            merged[key] = raw_value
+    merged["openclaw_manifest_id"] = manifest_id
+    merged["openclaw_manifest_name"] = manifest_name
+    return merged
+
+
+request_json("POST", "/auth/bootstrap")
+manifest_agents = parse_manifest_agents(manifest_agents_b64)
+if not manifest_agents:
+    print("MISSION_CONTROL_MANIFEST_AGENT_SYNC=created=0 updated=0 skipped=0 errors=0")
+    raise SystemExit(0)
+
+gateways = fetch_all("/gateways")
+gateway = pick_gateway(gateways)
+if not gateway:
+    raise RuntimeError("No Mission Control gateway available for manifest agent sync")
+gateway_id = str(gateway.get("id") or "").strip()
 if not gateway_id:
-    raise RuntimeError("cannot seed board: no gateway found in Mission Control")
+    raise RuntimeError("Selected Mission Control gateway has empty id")
 
-name = str(cfg("name", "MC_BOARD_NAME", "Main Board")).strip()
-if not name:
-    name = "Main Board"
-slug_raw = str(cfg("slug", "MC_BOARD_SLUG", "")).strip()
-slug = slug_raw or slugify(name)
-description = str(cfg("description", "MC_BOARD_DESCRIPTION", "Primary board for OpenClaw automation.")).strip()
-perspective = str(cfg("perspective", "MC_BOARD_PERSPECTIVE", "")).strip()
-if perspective:
-    perspective_block = f"Perspective:\n{perspective}"
-    if perspective_block not in description:
-        description = f"{description}\n\n{perspective_block}".strip()
+boards = fetch_all("/boards")
+target_board = pick_board(boards, gateway_id)
+if not target_board:
+    raise RuntimeError("No board available for manifest agent sync")
+board_id = str(target_board.get("id") or "").strip()
+if not board_id:
+    raise RuntimeError("Selected board has empty id")
 
-board_type = str(cfg("board_type", "MC_BOARD_TYPE", "goal")).strip() or "goal"
-goal_confirmed = parse_bool(cfg("goal_confirmed", "MC_BOARD_GOAL_CONFIRMED", False), False)
-objective = cfg("objective", "MC_BOARD_OBJECTIVE", None)
-if isinstance(objective, str):
-    objective = objective.strip() or None
-target_date = cfg("target_date", "MC_BOARD_TARGET_DATE", None)
-if isinstance(target_date, str):
-    target_date = target_date.strip() or None
-board_group_id = cfg("board_group_id", "MC_BOARD_GROUP_ID", None)
-if isinstance(board_group_id, str):
-    board_group_id = board_group_id.strip() or None
-max_agents = parse_int(cfg("max_agents", "MC_BOARD_MAX_AGENTS", 1), 1)
-goal_source = cfg("goal_source", "MC_BOARD_GOAL_SOURCE", None)
-if isinstance(goal_source, str):
-    goal_source = goal_source.strip() or None
+current_max = parse_int(target_board.get("max_agents"), 0)
+required_max = len(manifest_agents)
+if current_max < required_max:
+    _, patched_board = request_json(
+        "PATCH",
+        f"/boards/{board_id}",
+        payload={"max_agents": required_max},
+    )
+    if isinstance(patched_board, dict):
+        target_board = patched_board
+    current_max = required_max
 
-success_metrics = cfg("success_metrics", "MC_BOARD_SUCCESS_METRICS_JSON", None)
-if isinstance(success_metrics, str):
-    success_metrics_text = success_metrics.strip()
-    if success_metrics_text:
-        try:
-            success_metrics = json.loads(success_metrics_text)
-        except Exception as exc:
-            raise RuntimeError(f"invalid success_metrics JSON: {exc}") from exc
-    else:
-        success_metrics = None
-if success_metrics is not None and not isinstance(success_metrics, dict):
-    raise RuntimeError("success_metrics must be a JSON object")
+existing_agents = fetch_all("/agents", query={"board_id": board_id})
+existing_by_manifest_id = {}
+existing_by_name = {}
+for item in existing_agents:
+    name = str(item.get("name") or "").strip()
+    if name and name not in existing_by_name:
+        existing_by_name[name] = item
+    profile = item.get("identity_profile")
+    if isinstance(profile, dict):
+        manifest_id = str(profile.get("openclaw_manifest_id") or "").strip()
+        if manifest_id and manifest_id not in existing_by_manifest_id:
+            existing_by_manifest_id[manifest_id] = item
 
-payload = {
-    "name": name,
-    "slug": slug,
-    "description": description,
-    "gateway_id": gateway_id,
-    "board_type": board_type,
-    "goal_confirmed": goal_confirmed,
-    "max_agents": max_agents,
-}
-if objective:
-    payload["objective"] = objective
-if success_metrics is not None:
-    payload["success_metrics"] = success_metrics
-if target_date:
-    payload["target_date"] = target_date
-if board_group_id:
-    payload["board_group_id"] = board_group_id
-if goal_source:
-    payload["goal_source"] = goal_source
+created = 0
+updated = 0
+skipped = 0
+errors = []
 
-_, boards_payload = request_json("GET", "/boards", query={"limit": "200", "offset": "0"})
-boards = boards_payload.get("items") if isinstance(boards_payload, dict) else []
-if not isinstance(boards, list):
-    boards = []
-existing = None
-for item in boards:
-    if not isinstance(item, dict):
+for manifest_item in manifest_agents:
+    manifest_id = manifest_item["id"]
+    manifest_name = manifest_item["name"]
+    existing = existing_by_manifest_id.get(manifest_id) or existing_by_name.get(manifest_name)
+    try:
+        if existing:
+            existing_id = str(existing.get("id") or "").strip()
+            existing_name = str(existing.get("name") or "").strip()
+            existing_board_id = str(existing.get("board_id") or "").strip()
+            existing_profile = existing.get("identity_profile")
+            existing_manifest_id = ""
+            existing_manifest_name = ""
+            if isinstance(existing_profile, dict):
+                existing_manifest_id = str(existing_profile.get("openclaw_manifest_id") or "").strip()
+                existing_manifest_name = str(existing_profile.get("openclaw_manifest_name") or "").strip()
+            profile = normalize_identity_profile(existing_profile, manifest_id, manifest_name)
+            needs_update = (
+                existing_name != manifest_name
+                or existing_board_id != board_id
+                or existing_manifest_id != manifest_id
+                or existing_manifest_name != manifest_name
+            )
+            if needs_update and existing_id:
+                _, updated_payload = request_json(
+                    "PATCH",
+                    f"/agents/{existing_id}",
+                    payload={
+                        "board_id": board_id,
+                        "name": manifest_name,
+                        "identity_profile": profile,
+                    },
+                )
+                if isinstance(updated_payload, dict):
+                    existing = updated_payload
+                updated += 1
+            else:
+                skipped += 1
+        else:
+            _, created_payload = request_json(
+                "POST",
+                "/agents",
+                payload={
+                    "board_id": board_id,
+                    "name": manifest_name,
+                    "identity_profile": {
+                        "openclaw_manifest_id": manifest_id,
+                        "openclaw_manifest_name": manifest_name,
+                    },
+                },
+            )
+            if isinstance(created_payload, dict):
+                existing = created_payload
+            created += 1
+    except Exception as exc:
+        errors.append(f"{manifest_id}: {exc}")
         continue
-    if item.get("slug") == slug or item.get("name") == name:
-        existing = item
-        break
+    if isinstance(existing, dict):
+        existing_by_name[str(existing.get("name") or "").strip()] = existing
+        profile = existing.get("identity_profile")
+        if isinstance(profile, dict):
+            existing_manifest_id = str(profile.get("openclaw_manifest_id") or "").strip()
+            if existing_manifest_id:
+                existing_by_manifest_id[existing_manifest_id] = existing
 
-if existing and existing.get("id"):
-    _, board_payload = request_json("PATCH", f"/boards/{existing['id']}", payload=payload)
-    action = "updated"
-else:
-    _, board_payload = request_json("POST", "/boards", payload=payload)
-    action = "created"
-
-board_id = ""
-board_name = name
-board_slug = slug
-if isinstance(board_payload, dict):
-    board_id = str(board_payload.get("id") or "").strip()
-    board_name = str(board_payload.get("name") or board_name).strip()
-    board_slug = str(board_payload.get("slug") or board_slug).strip()
-
-print(f"MISSION_CONTROL_BOARD_ACTION={action}")
-print(f"MISSION_CONTROL_BOARD_ID={board_id}")
-print(f"MISSION_CONTROL_BOARD_NAME={board_name}")
-print(f"MISSION_CONTROL_BOARD_SLUG={board_slug}")
+print(
+    "MISSION_CONTROL_MANIFEST_AGENT_SYNC="
+    f"created={created} updated={updated} skipped={skipped} errors={len(errors)}"
+)
+print(f"MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID={board_id}")
+print(f"MISSION_CONTROL_MANIFEST_AGENT_BOARD_MAX_AGENTS={current_max}")
+for message in errors[:25]:
+    clean = str(message).replace("\n", " ").strip()
+    print(f"MISSION_CONTROL_MANIFEST_AGENT_ERROR={clean}")
 PY
-      mc_board_seed_b64="$(printf "%s" "$mc_board_seed_script" | base64 | tr -d '\r\n')"
-      mc_board_seed_launcher="import base64;exec(base64.b64decode('${mc_board_seed_b64}').decode('utf-8'))"
-      board_seed_output=""
-      if ! board_seed_output="$(
+      mc_manifest_agent_sync_script_b64="$(printf "%s" "$mc_manifest_agent_sync_script" | base64 | tr -d '\r\n')"
+      mc_manifest_agent_sync_launcher="import base64;exec(base64.b64decode('${mc_manifest_agent_sync_script_b64}').decode('utf-8'))"
+      manifest_agent_sync_output=""
+      if ! manifest_agent_sync_output="$(
         mission_control_compose exec -T \
           -e "MC_TOKEN=${OPENCLAW_MISSION_CONTROL_LOCAL_AUTH_TOKEN}" \
           -e "MC_GATEWAY_ID=${mission_control_registered_gateway_id}" \
           -e "MC_GATEWAY_NAME=${OPENCLAW_MISSION_CONTROL_GATEWAY_NAME}" \
           -e "MC_GATEWAY_URL=${OPENCLAW_MISSION_CONTROL_GATEWAY_URL}" \
-          -e "MC_BOARD_NAME=${OPENCLAW_MISSION_CONTROL_BOARD_NAME}" \
-          -e "MC_BOARD_SLUG=${OPENCLAW_MISSION_CONTROL_BOARD_SLUG}" \
-          -e "MC_BOARD_DESCRIPTION=${OPENCLAW_MISSION_CONTROL_BOARD_DESCRIPTION}" \
-          -e "MC_BOARD_PERSPECTIVE=${OPENCLAW_MISSION_CONTROL_BOARD_PERSPECTIVE}" \
-          -e "MC_BOARD_TYPE=${OPENCLAW_MISSION_CONTROL_BOARD_TYPE}" \
-          -e "MC_BOARD_OBJECTIVE=${OPENCLAW_MISSION_CONTROL_BOARD_OBJECTIVE}" \
-          -e "MC_BOARD_SUCCESS_METRICS_JSON=${OPENCLAW_MISSION_CONTROL_BOARD_SUCCESS_METRICS_JSON}" \
-          -e "MC_BOARD_TARGET_DATE=${OPENCLAW_MISSION_CONTROL_BOARD_TARGET_DATE}" \
-          -e "MC_BOARD_GOAL_CONFIRMED=${OPENCLAW_MISSION_CONTROL_BOARD_GOAL_CONFIRMED}" \
-          -e "MC_BOARD_GOAL_SOURCE=${OPENCLAW_MISSION_CONTROL_BOARD_GOAL_SOURCE}" \
-          -e "MC_BOARD_GROUP_ID=${OPENCLAW_MISSION_CONTROL_BOARD_GROUP_ID}" \
-          -e "MC_BOARD_MAX_AGENTS=${OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS}" \
-          -e "MC_BOARD_CONFIG_B64=${board_config_b64}" \
-          backend python -c "$mc_board_seed_launcher" 2>&1
+          -e "MC_TARGET_BOARD_ID=${OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID}" \
+          -e "MC_TARGET_BOARD_SLUG=${OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_SLUG}" \
+          -e "MC_SEEDED_BOARD_ID=${mission_control_seed_board_id}" \
+          -e "MC_MANIFEST_AGENTS_B64=${manifest_agents_b64}" \
+          backend python -c "$mc_manifest_agent_sync_launcher" 2>&1
       )"; then
-        printf "[openclaw-easy] Mission Control board seed failed (continuing).\n"
+        printf "[openclaw-easy] Mission Control manifest agent sync failed (continuing).\n"
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
-          printf "[openclaw-easy] mission-control-board: %s\n" "$line"
-        done <<<"$board_seed_output"
+          printf "[openclaw-easy] mission-control-agents: %s\n" "$line"
+        done <<<"$manifest_agent_sync_output"
       else
-        board_action=""
-        board_id=""
-        board_name=""
-        board_slug=""
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
-          if [[ "$line" == MISSION_CONTROL_BOARD_ACTION=* ]]; then
-            board_action="${line#MISSION_CONTROL_BOARD_ACTION=}"
-          elif [[ "$line" == MISSION_CONTROL_BOARD_ID=* ]]; then
-            board_id="${line#MISSION_CONTROL_BOARD_ID=}"
-          elif [[ "$line" == MISSION_CONTROL_BOARD_NAME=* ]]; then
-            board_name="${line#MISSION_CONTROL_BOARD_NAME=}"
-          elif [[ "$line" == MISSION_CONTROL_BOARD_SLUG=* ]]; then
-            board_slug="${line#MISSION_CONTROL_BOARD_SLUG=}"
+          if [[ "$line" == MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID=* ]]; then
+            manifest_board_id="${line#MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID=}"
+            if [[ -n "$manifest_board_id" ]]; then
+              export OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID="$manifest_board_id"
+              upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID" "$OPENCLAW_MISSION_CONTROL_MANIFEST_AGENT_BOARD_ID"
+            fi
+          elif [[ "$line" == MISSION_CONTROL_MANIFEST_AGENT_BOARD_MAX_AGENTS=* ]]; then
+            manifest_board_max_agents="${line#MISSION_CONTROL_MANIFEST_AGENT_BOARD_MAX_AGENTS=}"
+            if [[ -n "$manifest_board_max_agents" ]]; then
+              export OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS="$manifest_board_max_agents"
+              upsert_env "$ENV_FILE" "OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS" "$OPENCLAW_MISSION_CONTROL_BOARD_MAX_AGENTS"
+            fi
           fi
-          printf "[openclaw-easy] mission-control-board: %s\n" "$line"
-        done <<<"$board_seed_output"
-        if [[ -n "$board_action" || -n "$board_name" ]]; then
-          mission_control_seed_board_summary="action=$board_action name=$board_name slug=$board_slug id=$board_id"
-        fi
+          printf "[openclaw-easy] mission-control-agents: %s\n" "$line"
+        done <<<"$manifest_agent_sync_output"
       fi
     fi
     mission_control_dashboard_url="${mission_control_frontend_url}/"

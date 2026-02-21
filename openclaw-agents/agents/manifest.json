@@ -1,0 +1,120 @@
+{
+  "version": 1,
+  "generatedAt": "2026-02-20T23:44:02.131Z",
+  "sourceDir": "/work/openclaw-agents/agents",
+  "outputDir": "/work/openclaw-agents/agents",
+  "agents": [
+    {
+      "id": "main",
+      "name": "Jarvis",
+      "default": true,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/main",
+      "folder": "main"
+    },
+    {
+      "id": "backend",
+      "name": "Backend Engineer",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/backend",
+      "folder": "backend"
+    },
+    {
+      "id": "creative",
+      "name": "Creative Agent",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/creative",
+      "folder": "creative"
+    },
+    {
+      "id": "database",
+      "name": "Database Engineer",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/database",
+      "folder": "database"
+    },
+    {
+      "id": "designer",
+      "name": "Designer",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/designer",
+      "folder": "designer"
+    },
+    {
+      "id": "devops",
+      "name": "DevOps Agent",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/devops",
+      "folder": "devops"
+    },
+    {
+      "id": "financial",
+      "name": "Financial Expert",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/financial",
+      "folder": "financial"
+    },
+    {
+      "id": "frontend",
+      "name": "Frontend Engineer",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/frontend",
+      "folder": "frontend"
+    },
+    {
+      "id": "growth",
+      "name": "Growth Agent",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/growth",
+      "folder": "growth"
+    },
+    {
+      "id": "motivation",
+      "name": "Motivation Agent",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/motivation",
+      "folder": "motivation"
+    },
+    {
+      "id": "pm",
+      "name": "PM Agent",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/pm",
+      "folder": "pm"
+    },
+    {
+      "id": "qa",
+      "name": "QA Engineer",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/qa",
+      "folder": "qa"
+    },
+    {
+      "id": "research",
+      "name": "Research Engineer",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/research",
+      "folder": "research"
+    },
+    {
+      "id": "uiux",
+      "name": "UI/UX Expert",
+      "default": false,
+      "sourceFile": null,
+      "workspace": "/home/node/.openclaw/workspace/agents/uiux",
+      "folder": "uiux"
+    }
+  ]
+}
