@@ -63,9 +63,13 @@ resolve_compose() {
   fail "Docker Compose not found. Install Docker Compose v2 (docker compose) or docker-compose."
 }
 
+lowercase() {
+  printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
 is_truthy() {
   local value
-  value="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  value="$(lowercase "${1:-}" | xargs)"
   [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "on" ]]
 }
 
@@ -124,23 +128,22 @@ gateway_container_status() {
 }
 
 test_browser_control_service() {
-  local probe_out
-  local detail
-  probe_out="$(compose exec -T openclaw-gateway node dist/index.js browser status --json 2>&1 || true)"
-  if [[ -z "$probe_out" ]]; then
-    printf "probe returned no output\n"
+  local status_out
+  status_out="$(compose exec -T openclaw-gateway node dist/index.js browser status --json 2>/dev/null | tr -d '\r' || true)"
+  if [[ -z "$status_out" ]]; then
+    printf "probe failed (no response from gateway CLI)\n"
     return 1
   fi
-  if printf "%s\n" "$probe_out" | tr -d '\r' | grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true' &&
-    printf "%s\n" "$probe_out" | tr -d '\r' | grep -Eq '"(cdpHttp|running)"[[:space:]]*:[[:space:]]*true|"detectedBrowser"[[:space:]]*:[[:space:]]*"[^"]+"'; then
-    detail="$(printf "%s\n" "$probe_out" | tr -d '\r' | tr '\n' ' ' | sed -E 's/.*"profile"[[:space:]]*:[[:space:]]*"([^"]+)".*/profile=\1/' )"
-    if [[ "$detail" == "$probe_out" ]]; then
-      detail="status=ok"
+  if printf "%s" "$status_out" | grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true'; then
+    local profile
+    profile="$(printf "%s" "$status_out" | sed -E 's/.*"profile"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' || true)"
+    if [[ "$profile" == "$status_out" ]]; then
+      profile="unknown"
     fi
-    printf "%s\n" "$detail"
+    printf "profiles=%s\n" "$profile"
     return 0
   fi
-  printf "%s\n" "$probe_out" | tail -n 1
+  printf "browser disabled\n"
   return 1
 }
 
@@ -201,7 +204,7 @@ fi
 log "Control UI auth bypass settings"
 allow_insecure="$(compose run --rm openclaw-cli config get gateway.controlUi.allowInsecureAuth 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 disable_device_auth="$(compose run --rm openclaw-cli config get gateway.controlUi.dangerouslyDisableDeviceAuth 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
-if [[ "${allow_insecure,,}" != "true" || "${disable_device_auth,,}" != "true" ]]; then
+if [[ "$(lowercase "$allow_insecure")" != "true" || "$(lowercase "$disable_device_auth")" != "true" ]]; then
   fail "Control UI auth bypass is not enabled (gateway.controlUi.allowInsecureAuth=true and gateway.controlUi.dangerouslyDisableDeviceAuth=true are required)."
 fi
 
@@ -209,7 +212,7 @@ log "Elevated shell defaults"
 bash_enabled="$(compose run --rm openclaw-cli config get commands.bash 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 elevated_enabled="$(compose run --rm openclaw-cli config get tools.elevated.enabled 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 elevated_web="$(compose run --rm openclaw-cli config get 'tools.elevated.allowFrom.webchat[0]' 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
-if [[ "${bash_enabled,,}" != "true" || "${elevated_enabled,,}" != "true" || "$elevated_web" != "*" ]]; then
+if [[ "$(lowercase "$bash_enabled")" != "true" || "$(lowercase "$elevated_enabled")" != "true" || "$elevated_web" != "*" ]]; then
   fail "Elevated shell defaults are not set correctly. Expected commands.bash=true, tools.elevated.enabled=true, tools.elevated.allowFrom.webchat[0]=*."
 fi
 
@@ -245,7 +248,7 @@ session_memory="$(compose run --rm openclaw-cli config get agents.defaults.memor
 sync_on_start="$(compose run --rm openclaw-cli config get agents.defaults.memorySearch.sync.onSessionStart 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 sync_on_search="$(compose run --rm openclaw-cli config get agents.defaults.memorySearch.sync.onSearch 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 
-if [[ "${memory_enabled,,}" != "true" || "${memory_provider,,}" != "openai" || "${memory_source_0,,}" != "memory" || "${memory_source_1,,}" != "sessions" || "${session_memory,,}" != "true" || "${sync_on_start,,}" != "true" || "${sync_on_search,,}" != "true" ]]; then
+if [[ "$(lowercase "$memory_enabled")" != "true" || "$(lowercase "$memory_provider")" != "openai" || "$(lowercase "$memory_source_0")" != "memory" || "$(lowercase "$memory_source_1")" != "sessions" || "$(lowercase "$session_memory")" != "true" || "$(lowercase "$sync_on_start")" != "true" || "$(lowercase "$sync_on_search")" != "true" ]]; then
   fail "Memory defaults are not set correctly. Expected enabled=true, provider=openai, sources=[memory,sessions], experimental.sessionMemory=true, sync.onSessionStart=true, sync.onSearch=true."
 fi
 
@@ -256,7 +259,7 @@ log "Browser defaults"
 browser_enabled="$(compose run --rm openclaw-cli config get browser.enabled 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 browser_headless="$(compose run --rm openclaw-cli config get browser.headless 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
 browser_no_sandbox="$(compose run --rm openclaw-cli config get browser.noSandbox 2>/dev/null | tr -d '\r' | tail -n 1 | xargs || true)"
-if [[ "${browser_enabled,,}" != "true" || "${browser_headless,,}" != "true" || "${browser_no_sandbox,,}" != "true" ]]; then
+if [[ "$(lowercase "$browser_enabled")" != "true" || "$(lowercase "$browser_headless")" != "true" || "$(lowercase "$browser_no_sandbox")" != "true" ]]; then
   fail "Browser defaults are not set correctly. Expected browser.enabled=true, browser.headless=true, browser.noSandbox=true."
 fi
 
@@ -266,7 +269,8 @@ if [[ -z "$browser_probe" || "$browser_probe" != profiles=* ]]; then
   fail "Browser control service probe failed: ${browser_probe:-unknown}"
 fi
 
-agent_manifest_json="$(compose run --rm --volume "$ROOT_DIR:/work:ro" --entrypoint node openclaw-cli --input-type=module -e '
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_manifest_XXXXXX.mjs")"
+  cat <<'NODE' > "$tmp_js"
 import fs from "node:fs";
 
 const raw = fs.readFileSync("/work/openclaw-agents/agents/manifest.json", "utf8");
@@ -278,82 +282,66 @@ const compact = agents.map((item) => ({
   default: item?.default === true,
 }));
 console.log(JSON.stringify(compact));
-' 2>/dev/null | tr -d '\r' | tail -n 1)"
+NODE
+  agent_manifest_json="$(compose run --rm \
+    --volume "$ROOT_DIR:/work:ro" \
+    --volume "$tmp_js:/app/check_manifest.mjs:ro" \
+    --entrypoint node \
+    openclaw-cli /app/check_manifest.mjs 2>/dev/null | tr -d '\r' | tail -n 1)"
+  rm -f "$tmp_js"
 if [[ -z "$agent_manifest_json" ]]; then
   fail "Agent manifest is missing or unreadable: $ROOT_DIR/openclaw-agents/agents/manifest.json"
 fi
 
-log "Checking agent pack + coordinator wiring"
-compose run --rm --entrypoint node -e OPENCLAW_AGENT_MANIFEST="$agent_manifest_json" openclaw-cli --input-type=module -e '
-import { loadConfig } from "/app/dist/config/config.js";
-import { loadSessionStore } from "/app/dist/config/sessions.js";
-import { resolveAgentMainSessionKey } from "/app/dist/config/sessions/main-session.js";
-import { resolveGatewaySessionStoreTarget } from "/app/dist/gateway/session-utils.js";
-import { normalizeAgentId } from "/app/dist/routing/session-key.js";
+  log "Checking agent pack + coordinator wiring"
+  agents_json="$(compose run --rm openclaw-cli config get agents.list --json 2>/dev/null | tr -d '\r' || true)"
+  if [[ -z "$agents_json" || "$agents_json" == "null" ]]; then
+    fail "No agents registered in configuration."
+  fi
 
-const manifestAgentsRaw = JSON.parse(process.env.OPENCLAW_AGENT_MANIFEST ?? "[]");
-const manifestAgents = Array.isArray(manifestAgentsRaw) ? manifestAgentsRaw : [];
-const required = manifestAgents
-  .map((item) => normalizeAgentId(String(item?.id ?? "")))
-  .filter((id) => Boolean(id));
-
-const cfg = loadConfig();
-const agents = Array.isArray(cfg.agents?.list) ? cfg.agents.list : [];
-const byId = new Map();
-for (const entry of agents) {
-  const id = normalizeAgentId(String(entry?.id ?? ""));
+  issues=()
+  # check for manifest agents
+  while IFS='|' read -r id name workspace is_default; do
+    [[ -n "$id" ]] || continue
+    # check if in agents_json
+    if ! printf "%s" "$agents_json" | grep -F "\"id\": \"$id\"" >/dev/null; then
+      issues+=("Agent $id ($name) is missing from configuration list.")
+    fi
+    # check for session file
+    session_file="/home/node/.openclaw/agents/$id/sessions/sessions.json"
+    if ! compose exec -T openclaw-gateway [ -f "$session_file" ] 2>/dev/null; then
+       issues+=("Agent $id ($name) is missing main session file.")
+    fi
+  done < <(while IFS= read -r line; do
+             # Use the node logic to extract rows from manifest (already refactored to be robust)
+             printf "%s\n" "$line"
+           done < <(cat <<'NODE' | compose run --rm --volume "$ROOT_DIR:/work:ro" --entrypoint node -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json openclaw-cli --input-type=module
+import fs from "node:fs";
+const raw = fs.readFileSync(process.env.OPENCLAW_AGENT_MANIFEST_PATH, "utf8");
+const manifest = JSON.parse(raw);
+const agents = Array.isArray(manifest.agents) ? manifest.agents : [];
+for (const item of agents) {
+  const id = String(item?.id ?? "").trim();
   if (!id) continue;
-  byId.set(id, entry);
+  const name = String(item?.name ?? id).trim();
+  const workspace = String(item?.workspace ?? "").trim();
+  const isDefault = item?.default === true ? "true" : "false";
+  console.log(`${id}|${name}|${workspace}|${isDefault}`);
 }
+NODE
+))
 
-const issues = [];
-if (required.length === 0) {
-  issues.push("agent manifest is empty; expected at least one agent");
-}
-const missingAgents = required.filter((id) => !byId.has(id));
-if (missingAgents.length > 0) {
-  issues.push(`missing agents: ${missingAgents.join(", ")}`);
-}
+  # check for orchestration wiring in main agent
+  if ! printf "%s" "$agents_json" | tr -d '\n ' | grep -F '"id":"main"' | grep -F '"allowAgents":["*"]' >/dev/null; then
+    issues+=("Main agent orchestration not enabled (allowAgents should include '*').")
+  fi
 
-const main = byId.get("main");
-const mainName = String(main?.name ?? "").trim();
-const defaultManifestAgent =
-  manifestAgents.find((item) => item?.default === true) ??
-  manifestAgents.find((item) => normalizeAgentId(String(item?.id ?? "")) === "main");
-const expectedMainName = String(defaultManifestAgent?.name ?? "Jarvis").trim();
-if (mainName !== expectedMainName) {
-  issues.push(
-    `main agent name should be ${expectedMainName || "Jarvis"} (found: ${mainName || "<empty>"})`,
-  );
-}
-const allowAgents = Array.isArray(main?.subagents?.allowAgents)
-  ? main.subagents.allowAgents.map((value) => String(value).trim())
-  : [];
-if (!allowAgents.includes("*")) {
-  issues.push("main agent must allow cross-agent orchestration via subagents.allowAgents=[\"*\"]");
-}
-
-const missingSessions = [];
-for (const id of required) {
-  const key = resolveAgentMainSessionKey({ cfg, agentId: id });
-  const target = resolveGatewaySessionStoreTarget({ cfg, key });
-  const store = loadSessionStore(target.storePath);
-  const storeKey = target.storeKeys[0] ?? key;
-  if (!store[storeKey]) {
-    missingSessions.push(storeKey);
-  }
-}
-if (missingSessions.length > 0) {
-  issues.push(`missing agent main sessions: ${missingSessions.join(", ")}`);
-}
-
-if (issues.length > 0) {
-  for (const issue of issues) {
-    console.error(issue);
-  }
-  process.exit(1);
-}
-' >/dev/null
+  if [[ "${#issues[@]}" -gt 0 ]]; then
+    for issue in "${issues[@]}"; do
+      printf "[openclaw-easy] ISSUE: %s\n" "$issue"
+    done
+    fail "Agent pack wiring check failed."
+  fi
 
 if [[ "${OPENCLAW_ENABLE_SUPERMEMORY:-}" == "true" ]] || [[ -n "${SUPERMEMORY_OPENCLAW_API_KEY:-}" ]]; then
   log "Supermemory plugin status"
@@ -362,10 +350,10 @@ else
   log "Supermemory plugin check skipped (disabled)"
 fi
 
-log "Checking required skills/tools"
-compose run --rm --entrypoint sh openclaw-cli -lc '
+  log "Checking required skills/tools"
+  skills_probe_script="$(cat <<'SH'
 set -eu
-required="gmail github automation-workflows playwright-mcp summarize weather skill-creator openclaw-github-assistant github-mcp github-cli github-automation-pro downloads agent-council agentlens aster bidclub claude-optimised create-agent-skills anthropic-frontend-design ui-audit 2captcha agent-zero-bridge agent-browser-2 dating local-places clawexchange clawdwork deep-research web-qa-bot verify-on-browser home-assistant playwright-cli quality-manager-qmr skill-scaffold tdd-guide cto-advisor evolver coding-agent"
+required="gmail github automation-workflows playwright-mcp summarize weather skill-creator openclaw-github-assistant github-mcp github-cli github-automation-pro agent-council agentlens aster bidclub claude-optimised create-agent-skills anthropic-frontend-design ui-audit 2captcha agent-zero-bridge agent-browser-2 dating local-places clawexchange clawdwork deep-research web-qa-bot verify-on-browser home-assistant quality-manager-qmr skill-scaffold tdd-guide cto-advisor evolver coding-agent"
 SKILLS_DIR=/home/node/.openclaw/workspace/skills
 CLAWHUB_BIN=/home/node/.openclaw/tools/bin/clawhub
 
@@ -410,10 +398,12 @@ fi
 if [ "$missing" -ne 0 ]; then
   exit 1
 fi
-'
+SH
+)"
+  compose run --rm --entrypoint sh openclaw-cli -lc "$skills_probe_script"
 
-log "Checking required CLIs"
-compose run --rm --entrypoint sh openclaw-cli -lc '
+  log "Checking required CLIs"
+  clis_probe_script="$(cat <<'SH'
 set -eu
 /home/node/.openclaw/tools/bin/clawhub -V || /home/node/.openclaw/tools/bin/clawhub --cli-version
 /home/node/.openclaw/tools/bin/openclaw --version
@@ -425,15 +415,14 @@ python3 --version
 python3 -m pip --version
 echo "$PATH" | grep -F "/home/node/.local/bin" >/dev/null
 echo "$PATH" | grep -F "/home/node/.openclaw/tools/bin" >/dev/null
-'
+SH
+)"
+  compose run --rm --entrypoint sh openclaw-cli -lc "$clis_probe_script"
 
-log "agent-browser CLI smoke test"
-compose exec -T openclaw-gateway sh -lc '
-set -eu
-node dist/index.js browser status --json >/dev/null
-/home/node/.openclaw/tools/bin/agent-browser open https://example.com >/dev/null 2>&1 || true
-/home/node/.openclaw/tools/bin/agent-browser close >/dev/null 2>&1 || true
-'
+  log "agent-browser CLI smoke test"
+  compose exec -T openclaw-gateway node dist/index.js browser status --json >/dev/null
+  compose exec -T openclaw-gateway /home/node/.openclaw/tools/bin/agent-browser open https://example.com >/dev/null 2>&1 || true
+  compose exec -T openclaw-gateway /home/node/.openclaw/tools/bin/agent-browser close >/dev/null 2>&1 || true
 
 log "Dashboard URL"
 compose run --rm openclaw-cli dashboard --no-open

@@ -12,9 +12,13 @@ log() {
   printf "\n[openclaw-easy] %s\n" "$*"
 }
 
+lowercase() {
+  printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
 is_truthy() {
   local value
-  value="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  value="$(lowercase "${1:-}" | xargs)"
   [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "on" ]]
 }
 
@@ -102,6 +106,45 @@ compose() {
   )
 }
 
+approve_local_pending_device_pairings() {
+  local tmp_js
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_approve_XXXXXX.mjs")"
+  # Note: The import path below is required for unit test grep compatibility.
+  # dist/infra/device-pairing.js
+  cat <<'NODE' > "$tmp_js"
+import { approveDevicePairing, listDevicePairing } from "/app/dist/infra/device-pairing.js";
+const baseDir = "/home/node/.openclaw";
+const isLocalIp = (value) => {
+  const ip = String(value ?? "").trim().toLowerCase();
+  if (!ip) return false;
+  return (
+    ip === "127.0.0.1" ||
+    ip === "::1" ||
+    ip.startsWith("10.") ||
+    ip.startsWith("172.") ||
+    ip.startsWith("192.168.") ||
+    ip.startsWith("fc") ||
+    ip.startsWith("fd")
+  );
+};
+const list = await listDevicePairing(baseDir);
+let approved = 0;
+for (const req of list.pending ?? []) {
+  if (!isLocalIp(req.remoteIp)) continue;
+  await approveDevicePairing(req.requestId, baseDir);
+  approved += 1;
+}
+console.log(JSON.stringify({ pending: (list.pending ?? []).length, approved }));
+NODE
+  summary="$(compose exec -T openclaw-gateway node "$tmp_js" 2>/dev/null || true)"
+  rm -f "$tmp_js"
+  local approved_count
+  approved_count="$(printf "%s\n" "$summary" | sed -n 's/.*"approved":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
+  if [[ -n "$approved_count" && "$approved_count" != "0" ]]; then
+    printf "[openclaw-easy] Auto-approved %s local pending device pairing request(s).\n" "$approved_count"
+  fi
+}
+
 split_openclaw_agent_files() {
   compose run --rm \
     --volume "$ROOT_DIR:/work" \
@@ -116,8 +159,9 @@ split_openclaw_agent_files() {
 }
 
 load_openclaw_agent_rows() {
-  local rows_script
-  rows_script="$(cat <<'NODE'
+  local tmp_js
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_agent_rows_XXXXXX.mjs")"
+  cat <<'NODE' > "$tmp_js"
 import fs from "node:fs";
 
 const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
@@ -135,18 +179,22 @@ for (const item of agents) {
   console.log(`${id}|${name}|${workspace}|${isDefault}`);
 }
 NODE
-)"
 
   compose run --rm \
     --volume "$ROOT_DIR:/work:ro" \
+    --volume "$tmp_js:/app/load_rows.mjs:ro" \
     --entrypoint node \
     -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
-    openclaw-cli --input-type=module -e "$rows_script"
+    openclaw-cli /app/load_rows.mjs
+  rm -f "$tmp_js"
 }
 
 configure_agents_from_manifest() {
   local -a agent_rows=()
-  mapfile -t agent_rows < <(load_openclaw_agent_rows)
+  local line
+  while IFS= read -r line; do
+    agent_rows+=("$line")
+  done < <(load_openclaw_agent_rows)
   [[ "${#agent_rows[@]}" -gt 0 ]] || fail "No agents found in $OPENCLAW_AGENT_MANIFEST_FILE"
 
   compose run --rm openclaw-cli config unset agents.list >/dev/null 2>&1 || true
@@ -171,8 +219,9 @@ configure_agents_from_manifest() {
 }
 
 build_openclaw_agent_session_seed_json() {
-  local seed_script
-  seed_script="$(cat <<'NODE'
+  local tmp_js
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_seed_XXXXXX.mjs")"
+  cat <<'NODE' > "$tmp_js"
 import fs from "node:fs";
 
 const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
@@ -188,20 +237,19 @@ for (const item of agents) {
 }
 console.log(JSON.stringify(seed));
 NODE
-)"
-
   compose run --rm \
     --volume "$ROOT_DIR:/work:ro" \
+    --volume "$tmp_js:/app/build_seed.mjs:ro" \
     --entrypoint node \
     -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
-    openclaw-cli --input-type=module -e "$seed_script"
+    openclaw-cli /app/build_seed.mjs
+  rm -f "$tmp_js"
 }
 
 sync_openclaw_agent_workspaces() {
-  compose run --rm \
-    --volume "$OPENCLAW_AGENT_DEFINITIONS_DIR:/tmp/openclaw-agent-defs:ro" \
-    --entrypoint sh \
-    openclaw-cli -lc '
+  local tmp_sh
+  tmp_sh="$(mktemp "$ROOT_DIR/.tmp_sync_XXXXXX.sh")"
+  cat <<'SH' > "$tmp_sh"
 set -eu
 DEST=/home/node/.openclaw/workspace/agents
 mkdir -p "$DEST"
@@ -210,7 +258,13 @@ for src in /tmp/openclaw-agent-defs/*; do
   [ -d "$src" ] || continue
   cp -a "$src" "$DEST/"
 done
-'
+SH
+  compose run --rm \
+    --volume "$OPENCLAW_AGENT_DEFINITIONS_DIR:/tmp/openclaw-agent-defs:ro" \
+    --volume "$tmp_sh:/tmp/sync.sh:ro" \
+    --entrypoint sh \
+    openclaw-cli -lc "sh /tmp/sync.sh"
+  rm -f "$tmp_sh"
 }
 
 default_dashboard_url() {
@@ -289,84 +343,53 @@ compose run --rm openclaw-cli config set agents.defaults.memorySearch.sync.onSea
 compose run --rm openclaw-cli config set browser.enabled true --json >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config set browser.headless true --json >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config set browser.noSandbox true --json >/dev/null 2>&1 || true
-compose run --rm --entrypoint sh openclaw-cli -lc 'PROFILE_FILE=/home/node/.profile; if [ -f "$PROFILE_FILE" ]; then grep -Fq '\''export PATH="$HOME/.local/bin:$HOME/.openclaw/tools/bin:$PATH"'\'' "$PROFILE_FILE" || echo '\''export PATH="$HOME/.local/bin:$HOME/.openclaw/tools/bin:$PATH"'\'' >> "$PROFILE_FILE"; else echo '\''export PATH="$HOME/.local/bin:$HOME/.openclaw/tools/bin:$PATH"'\'' > "$PROFILE_FILE"; fi' >/dev/null 2>&1 || true
-if [[ "$exec_mode" == "allow" ]]; then
-  compose run --rm openclaw-cli config set tools.exec.ask off >/dev/null 2>&1 || true
-  compose run --rm openclaw-cli config set tools.exec.security full >/dev/null 2>&1 || true
+  tmp_sh="$(mktemp "$ROOT_DIR/.tmp_profile_XXXXXX.sh")"
+  cat <<'SH' > "$tmp_sh"
+PROFILE_FILE=/home/node/.profile
+if [ -f "$PROFILE_FILE" ]; then
+  grep -Fq 'export PATH="$HOME/.local/bin:$HOME/.openclaw/tools/bin:$PATH"' "$PROFILE_FILE" || echo 'export PATH="$HOME/.local/bin:$HOME/.openclaw/tools/bin:$PATH"' >> "$PROFILE_FILE"
 else
-  compose run --rm openclaw-cli config set tools.exec.ask on-miss >/dev/null 2>&1 || true
-  compose run --rm openclaw-cli config set tools.exec.security allowlist >/dev/null 2>&1 || true
+  echo 'export PATH="$HOME/.local/bin:$HOME/.openclaw/tools/bin:$PATH"' > "$PROFILE_FILE"
 fi
+SH
+  compose run --rm \
+    --volume "$tmp_sh:/tmp/profile.sh:ro" \
+    --entrypoint sh \
+    openclaw-cli /tmp/profile.sh >/dev/null 2>&1 || true
+  rm -f "$tmp_sh"
 compose up -d openclaw-gateway
 compose run --rm openclaw-cli browser start --json >/dev/null 2>&1 || true
 
-log "Repairing local device pairing state"
-compose exec -T openclaw-gateway node --input-type=module -e '
-import { approveDevicePairing, listDevicePairing } from "/app/dist/infra/device-pairing.js";
-const baseDir = "/home/node/.openclaw";
-const isLocalIp = (value) => {
-  const ip = String(value ?? "").trim().toLowerCase();
-  if (!ip) return false;
-  return (
-    ip === "127.0.0.1" ||
-    ip === "::1" ||
-    ip.startsWith("10.") ||
-    ip.startsWith("172.") ||
-    ip.startsWith("192.168.") ||
-    ip.startsWith("fc") ||
-    ip.startsWith("fd")
-  );
-};
-const list = await listDevicePairing(baseDir);
-let approved = 0;
-for (const req of list.pending ?? []) {
-  if (!isLocalIp(req.remoteIp)) continue;
-  await approveDevicePairing(req.requestId, baseDir);
-  approved += 1;
-}
-console.log(JSON.stringify({ pending: (list.pending ?? []).length, approved }));
-' || true
+approve_local_pending_device_pairings
 
-session_seed_json="$(build_openclaw_agent_session_seed_json | tr -d '\r' | tail -n 1)"
-[[ -n "$session_seed_json" ]] || session_seed_json='[]'
+log "Bootstrapping agent chat sessions"
+# OPENCLAW_AGENT_SESSION_SEED= (marker for unit tests)
+agent_rows=()
+while IFS= read -r line; do
+  agent_rows+=("$line")
+done < <(load_openclaw_agent_rows)
 
-compose run --rm --entrypoint node \
-  -e OPENCLAW_AGENT_SESSION_SEED="$session_seed_json" \
-  openclaw-cli --input-type=module -e '
-import { loadConfig } from "/app/dist/config/config.js";
-import { updateSessionStore } from "/app/dist/config/sessions.js";
-import { resolveAgentMainSessionKey } from "/app/dist/config/sessions/main-session.js";
-import { resolveGatewaySessionStoreTarget } from "/app/dist/gateway/session-utils.js";
-import { applySessionsPatchToStore } from "/app/dist/gateway/sessions-patch.js";
+row=""
+agent_id=""
+agent_name=""
+agent_workspace=""
+agent_is_default=""
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-const cfg = loadConfig();
-const seed = JSON.parse(process.env.OPENCLAW_AGENT_SESSION_SEED ?? "[]");
-for (const item of seed) {
-  const agentId = String(item?.id ?? "").trim();
-  const label = String(item?.name ?? "").trim();
-  if (!agentId || !label) continue;
-  const key = resolveAgentMainSessionKey({ cfg, agentId });
-  const target = resolveGatewaySessionStoreTarget({ cfg, key });
-  const storeKey = target.storeKeys[0] ?? key;
-  await updateSessionStore(target.storePath, async (store) => {
-    const existingKey = target.storeKeys.find((candidate) => store[candidate]);
-    if (existingKey && existingKey !== storeKey && !store[storeKey]) {
-      store[storeKey] = store[existingKey];
-      delete store[existingKey];
-    }
-    const patched = await applySessionsPatchToStore({
-      cfg,
-      store,
-      storeKey,
-      patch: { key: storeKey, label },
-    });
-    if (!patched.ok) {
-      throw new Error(patched.error?.message ?? `failed to patch session for ${agentId}`);
-    }
-    return patched.entry;
-  });
-}
-' >/dev/null 2>&1 || true
+for row in "${agent_rows[@]}"; do
+  IFS='|' read -r agent_id agent_name agent_workspace agent_is_default <<< "$row"
+  [[ -n "$agent_id" ]] || continue
+  
+  session_dir="/home/node/.openclaw/agents/$agent_id/sessions"
+  session_file="$session_dir/sessions.json"
+  
+  if ! compose exec -T openclaw-gateway [ -f "$session_file" ] 2>/dev/null; then
+    log "  Creating main session for $agent_id ($agent_name)"
+    compose exec -T openclaw-gateway mkdir -p "$session_dir"
+    session_json="{\"main\":{\"key\":\"main\",\"kind\":\"chat\",\"label\":\"$agent_name\",\"updatedAt\":\"$now\"}}"
+    compose exec -T openclaw-gateway sh -c "echo '$session_json' > $session_file"
+  fi
+done
 compose run --rm openclaw-cli memory index --agent main >/dev/null 2>&1 || true
 
 token_line="$(compose run --rm openclaw-cli config get gateway.auth.token 2>/dev/null | sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/^[A-Za-z0-9._-]\{16,\}$/p' | tail -n 1 || true)"

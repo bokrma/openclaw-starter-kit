@@ -136,9 +136,13 @@ upsert_env() {
   mv "$tmp" "$file"
 }
 
+lowercase() {
+  printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]'
+}
+
 is_truthy() {
   local value
-  value="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  value="$(lowercase "${1:-}" | xargs)"
   [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "on" ]]
 }
 
@@ -736,8 +740,9 @@ is_private_or_loopback_ip() {
 }
 
 approve_local_pending_device_pairings() {
-  local summary
-  summary="$(compose exec -T openclaw-gateway node --input-type=module -e '
+  local tmp_js
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_approve_XXXXXX.mjs")"
+  cat <<'NODE' > "$tmp_js"
 import { approveDevicePairing, listDevicePairing } from "/app/dist/infra/device-pairing.js";
 const baseDir = "/home/node/.openclaw";
 const isLocalIp = (value) => {
@@ -761,7 +766,9 @@ for (const req of list.pending ?? []) {
   approved += 1;
 }
 console.log(JSON.stringify({ pending: (list.pending ?? []).length, approved }));
-' 2>/dev/null || true)"
+NODE
+  summary="$(compose exec -T openclaw-gateway node "$tmp_js" 2>/dev/null || true)"
+  rm -f "$tmp_js"
   local approved_count
   approved_count="$(printf "%s\n" "$summary" | sed -n 's/.*"approved":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -n 1)"
   if [[ -n "$approved_count" && "$approved_count" != "0" ]]; then
@@ -923,8 +930,9 @@ split_openclaw_agent_files() {
 }
 
 load_openclaw_agent_rows() {
-  local rows_script
-  rows_script="$(cat <<'NODE'
+  local tmp_js
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_agent_rows_XXXXXX.mjs")"
+  cat <<'NODE' > "$tmp_js"
 import fs from "node:fs";
 
 const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
@@ -942,18 +950,20 @@ for (const item of agents) {
   console.log(`${id}|${name}|${workspace}|${isDefault}`);
 }
 NODE
-)"
 
   compose run --rm \
     --volume "$ROOT_DIR:/work:ro" \
+    --volume "$tmp_js:/app/load_rows.mjs:ro" \
     --entrypoint node \
     -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
-    openclaw-cli --input-type=module -e "$rows_script"
+    openclaw-cli /app/load_rows.mjs
+  rm -f "$tmp_js"
 }
 
 build_openclaw_agent_session_seed_json() {
-  local seed_script
-  seed_script="$(cat <<'NODE'
+  local tmp_js
+  tmp_js="$(mktemp "$ROOT_DIR/.tmp_seed_XXXXXX.mjs")"
+  cat <<'NODE' > "$tmp_js"
 import fs from "node:fs";
 
 const manifestPath = process.env.OPENCLAW_AGENT_MANIFEST_PATH ?? "";
@@ -969,20 +979,20 @@ for (const item of agents) {
 }
 console.log(JSON.stringify(seed));
 NODE
-)"
 
   compose run --rm \
     --volume "$ROOT_DIR:/work:ro" \
+    --volume "$tmp_js:/app/build_seed.mjs:ro" \
     --entrypoint node \
     -e OPENCLAW_AGENT_MANIFEST_PATH=/work/openclaw-agents/agents/manifest.json \
-    openclaw-cli --input-type=module -e "$seed_script"
+    openclaw-cli /app/build_seed.mjs
+  rm -f "$tmp_js"
 }
 
 sync_openclaw_agent_workspaces() {
-  compose run --rm \
-    --volume "$OPENCLAW_AGENT_DEFINITIONS_DIR:/tmp/openclaw-agent-defs:ro" \
-    --entrypoint sh \
-    openclaw-cli -lc '
+  local tmp_sh
+  tmp_sh="$(mktemp "$ROOT_DIR/.tmp_sync_XXXXXX.sh")"
+  cat <<'SH' > "$tmp_sh"
 set -eu
 DEST=/home/node/.openclaw/workspace/agents
 mkdir -p "$DEST"
@@ -991,12 +1001,22 @@ for src in /tmp/openclaw-agent-defs/*; do
   [ -d "$src" ] || continue
   cp -a "$src" "$DEST/"
 done
-'
+SH
+
+  compose run --rm \
+    --volume "$OPENCLAW_AGENT_DEFINITIONS_DIR:/tmp/openclaw-agent-defs:ro" \
+    --volume "$tmp_sh:/app/sync.sh:ro" \
+    --entrypoint sh \
+    openclaw-cli -lc "sh /app/sync.sh"
+  rm -f "$tmp_sh"
 }
 
 configure_agents() {
   local -a agent_rows=()
-  mapfile -t agent_rows < <(load_openclaw_agent_rows)
+  local line
+  while IFS= read -r line; do
+    agent_rows+=("$line")
+  done < <(load_openclaw_agent_rows)
   [[ "${#agent_rows[@]}" -gt 0 ]] || fail "No agents found in $OPENCLAW_AGENT_MANIFEST_FILE"
 
   compose run --rm openclaw-cli config set agents.defaults.model.primary openai/gpt-5.2
@@ -1066,52 +1086,36 @@ sync_exec_approvals_mode() {
 }
 
 bootstrap_agent_main_sessions() {
-  local session_seed_json
-  session_seed_json="$(build_openclaw_agent_session_seed_json | tr -d '\r' | tail -n 1)"
-  [[ -n "$session_seed_json" ]] || session_seed_json="[]"
+  log "Bootstrapping agent chat sessions"
+  local agent_rows=()
+  local line
+  while IFS= read -r line; do
+    agent_rows+=("$line")
+  done < <(load_openclaw_agent_rows)
 
-  compose run --rm --entrypoint node \
-    -e OPENCLAW_AGENT_SESSION_SEED="$session_seed_json" \
-    openclaw-cli --input-type=module -e '
-import { loadConfig } from "/app/dist/config/config.js";
-import { updateSessionStore } from "/app/dist/config/sessions.js";
-import { resolveAgentMainSessionKey } from "/app/dist/config/sessions/main-session.js";
-import { resolveGatewaySessionStoreTarget } from "/app/dist/gateway/session-utils.js";
-import { applySessionsPatchToStore } from "/app/dist/gateway/sessions-patch.js";
+  local row=""
+  local agent_id=""
+  local agent_name=""
+  local agent_workspace=""
+  local agent_is_default=""
+  local now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-const cfg = loadConfig();
-const seed = JSON.parse(process.env.OPENCLAW_AGENT_SESSION_SEED ?? "[]");
-let bootstrapped = 0;
-
-for (const item of seed) {
-  const agentId = String(item?.id ?? "").trim();
-  const label = String(item?.name ?? "").trim();
-  if (!agentId || !label) continue;
-  const key = resolveAgentMainSessionKey({ cfg, agentId });
-  const target = resolveGatewaySessionStoreTarget({ cfg, key });
-  const storeKey = target.storeKeys[0] ?? key;
-  await updateSessionStore(target.storePath, async (store) => {
-    const existingKey = target.storeKeys.find((candidate) => store[candidate]);
-    if (existingKey && existingKey !== storeKey && !store[storeKey]) {
-      store[storeKey] = store[existingKey];
-      delete store[existingKey];
-    }
-    const patched = await applySessionsPatchToStore({
-      cfg,
-      store,
-      storeKey,
-      patch: { key: storeKey, label },
-    });
-    if (!patched.ok) {
-      throw new Error(patched.error?.message ?? `failed to patch session for ${agentId}`);
-    }
-    return patched.entry;
-  });
-  bootstrapped += 1;
-}
-
-console.log(JSON.stringify({ requested: seed.length, bootstrapped }));
-' >/dev/null 2>&1 || printf "[openclaw-easy] Could not bootstrap agent chat sessions (continuing).\n"
+  for row in "${agent_rows[@]}"; do
+    IFS='|' read -r agent_id agent_name agent_workspace agent_is_default <<< "$row"
+    [[ -n "$agent_id" ]] || continue
+    
+    # Standard session location is /home/node/.openclaw/agents/<id>/sessions/sessions.json
+    local session_dir="/home/node/.openclaw/agents/$agent_id/sessions"
+    local session_file="$session_dir/sessions.json"
+    
+    # We use compose exec because the gateway is already running by this point in start.sh
+    if ! compose exec -T openclaw-gateway [ -f "$session_file" ] 2>/dev/null; then
+      log "  Creating main session for $agent_id ($agent_name)"
+      compose exec -T openclaw-gateway mkdir -p "$session_dir"
+      local session_json="{\"main\":{\"key\":\"main\",\"kind\":\"chat\",\"label\":\"$agent_name\",\"updatedAt\":\"$now\"}}"
+      compose exec -T openclaw-gateway sh -c "echo '$session_json' > $session_file"
+    fi
+  done
 }
 
 main() {
@@ -1208,7 +1212,9 @@ main() {
   export OPENCLAW_COMMAND_CENTER_PORT="${OPENCLAW_COMMAND_CENTER_PORT:-3340}"
   export OPENCLAW_COMMAND_CENTER_AUTH_MODE="${OPENCLAW_COMMAND_CENTER_AUTH_MODE:-token}"
   export OPENCLAW_COMMAND_CENTER_TOKEN="${OPENCLAW_COMMAND_CENTER_TOKEN:-}"
-  if [[ "${OPENCLAW_COMMAND_CENTER_AUTH_MODE,,}" == "token" && -z "${OPENCLAW_COMMAND_CENTER_TOKEN:-}" ]]; then
+  local auth_mode_lower
+  auth_mode_lower="$(lowercase "$OPENCLAW_COMMAND_CENTER_AUTH_MODE")"
+  if [[ "$auth_mode_lower" == "token" && -z "${OPENCLAW_COMMAND_CENTER_TOKEN:-}" ]]; then
     OPENCLAW_COMMAND_CENTER_TOKEN="$(generate_token)"
     export OPENCLAW_COMMAND_CENTER_TOKEN
     printf "[openclaw-easy] Generated Command Center dashboard token.\n"
@@ -1413,11 +1419,15 @@ main() {
     compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.config.apiKey '${SUPERMEMORY_OPENCLAW_API_KEY}'
   else
     log "Skipping Supermemory plugin (no key provided)"
-    compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.enabled false --json || true
+    if compose run --rm openclaw-cli plugins info openclaw-supermemory --json >/dev/null 2>&1; then
+      compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.enabled false --json || true
+    fi
   fi
 
   log "Bootstrapping tools + skills"
-  compose run --rm --entrypoint sh openclaw-cli -lc '
+  local tmp_sh
+  tmp_sh="$(mktemp "$ROOT_DIR/.tmp_bootstrap_XXXXXX.sh")"
+  cat <<'SH' > "$tmp_sh"
 set -eu
 WORKSPACE=/home/node/.openclaw/workspace
 TMP_DIR="$WORKSPACE/tmp"
@@ -1511,33 +1521,44 @@ fi
 rm -rf "$TMP_DIR/openclaw-community-skills"
 git clone --depth 1 https://github.com/openclaw/skills "$TMP_DIR/openclaw-community-skills"
 for pair in \
-  gxsy886/downloads \
-  itsahedge/agent-council \
-  nguyenphutrong/agentlens \
-  satyajiit/aster \
-  jasonfdg/bidclub \
-  hexnickk/claude-optimised \
-  bowen31337/create-agent-skills \
-  qrucio/anthropic-frontend-design \
-  tommygeoco/ui-audit \
-  adinvadim/2captcha \
-  dowingard/agent-zero-bridge \
-  murphykobe/agent-browser-2 \
-  lucasgeeksinthewood/dating \
-  steipete/local-places \
-  tiborera/clawexchange \
-  felo-sparticle/clawdwork \
-  seyhunak/deep-research \
-  nextfrontierbuilds/web-qa-bot \
-  myestery/verify-on-browser \
-  iahmadzain/home-assistant \
-  gumadeiras/playwright-cli \
-  alirezarezvani/quality-manager-qmr \
-  nextfrontierbuilds/skill-scaffold \
-  alirezarezvani/tdd-guide \
-  alirezarezvani/cto-advisor \
-  autogame-17/evolver \
-  steipete/coding-agent
+    byungkyu/gmail \
+    steipete/github \
+    jk-0001/automation-workflows \
+    spiceman161/playwright-mcp \
+    steipete/summarize \
+    steipete/weather \
+    chindden/skill-creator \
+    conorkenn/openclaw-github-assistant \
+    buddhasource/github-mcp \
+    tag-assistant/github-cli \
+    andy825lay-tech/github-automation-pro \
+    gxsy886/downloads \
+    itsahedge/agent-council \
+    nguyenphutrong/agentlens \
+    satyajiit/aster \
+    jasonfdg/bidclub \
+    hexnickk/claude-optimised \
+    bowen31337/create-agent-skills \
+    qrucio/anthropic-frontend-design \
+    tommygeoco/ui-audit \
+    adinvadim/2captcha \
+    dowingard/agent-zero-bridge \
+    murphykobe/agent-browser-2 \
+    lucasgeeksinthewood/dating \
+    steipete/local-places \
+    tiborera/clawexchange \
+    felo-sparticle/clawdwork \
+    seyhunak/deep-research \
+    nextfrontierbuilds/web-qa-bot \
+    myestery/verify-on-browser \
+    iahmadzain/home-assistant \
+    gumadeiras/playwright-cli \
+    alirezarezvani/quality-manager-qmr \
+    nextfrontierbuilds/skill-scaffold \
+    alirezarezvani/tdd-guide \
+    alirezarezvani/cto-advisor \
+    autogame-17/evolver \
+    steipete/coding-agent
 do
   owner="${pair%%/*}"
   skill="${pair##*/}"
@@ -1559,7 +1580,12 @@ done
 
 # ClawHub installs can replace wrappers; enforce executable bits again.
 chmod +x "$TOOLS_DIR/bin/openclaw" "$TOOLS_DIR/bin/agent-browser" || true
-'
+SH
+  compose run --rm \
+    --volume "$tmp_sh:/app/bootstrap.sh:ro" \
+    --entrypoint sh \
+    openclaw-cli /app/bootstrap.sh
+  rm -f "$tmp_sh"
 
   log "Finalizing CLI backend commands"
   compose run --rm openclaw-cli config set "agents.defaults.cliBackends[claude-cli].command" "/home/node/.openclaw/tools/bin/claude"
@@ -1616,7 +1642,7 @@ chmod +x "$TOOLS_DIR/bin/openclaw" "$TOOLS_DIR/bin/agent-browser" || true
   browser_ready=false
   for attempt in $(seq 1 15); do
     probe_detail="$(test_browser_control_service || true)"
-    if [[ -n "$probe_detail" && "$probe_detail" == profiles=* ]]; then
+    if [[ -n "$probe_detail" && "$probe_detail" == profile=* ]]; then
       browser_ready=true
       break
     fi
