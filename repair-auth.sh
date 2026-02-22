@@ -310,11 +310,12 @@ sync_openclaw_agent_workspaces
 configure_agents_from_manifest
 
 log "Reapplying gateway auth token"
-compose run --rm openclaw-cli config set gateway.mode local
-compose run --rm openclaw-cli config set gateway.auth.mode token
-compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN"
-compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json
-compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json
+compose run --rm openclaw-cli config set gateway.mode local 2>&1 | grep -v "Restart the gateway" || true
+compose run --rm openclaw-cli config set gateway.auth.mode token 2>&1 | grep -v "Restart the gateway" || true
+compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" 2>&1 | grep -v "Restart the gateway" || true
+compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json 2>&1 | grep -v "Restart the gateway" || true
+compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json 2>&1 | grep -v "Restart the gateway" || true
+log "Gateway configuration updated. Restart the gateway to apply changes."
 compose run --rm openclaw-cli config set tools.agentToAgent.enabled true --json >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config unset tools.agentToAgent.allow >/dev/null 2>&1 || true
 compose run --rm openclaw-cli config set 'tools.agentToAgent.allow[0]' "*" >/dev/null 2>&1 || true

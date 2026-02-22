@@ -311,6 +311,11 @@ function Patch-MissionControlSecurityBaselines {
             "clerk-backend-api==4.2.0",
             "clerk-backend-api==5.0.2"
         )
+
+        # Remove any duplicate/conflicting cryptography entries (like cryptography==45.0.7)
+        $backendPyprojectUpdated = $backendPyprojectUpdated -replace '\s*"cryptography==[\d\.]+",?\r?\n?', ''
+
+        # Ensure the correct cryptography constraint is present
         if ($backendPyprojectUpdated -notmatch 'cryptography>=46\.0\.5,<47') {
             $backendPyprojectUpdated = $backendPyprojectUpdated.Replace(
                 '"clerk-backend-api==5.0.2",',
@@ -320,6 +325,22 @@ function Patch-MissionControlSecurityBaselines {
         if ($backendPyprojectUpdated -ne $backendPyprojectText) {
             Set-Content -Path $backendPyproject -Value $backendPyprojectUpdated -Encoding UTF8
             Write-Host "[openclaw-easy] Patched Mission Control backend dependency baseline."
+
+            # Regenerate uv.lock if pyproject.toml was patched
+            $backendDir = Split-Path -Parent $backendPyproject
+            $uvLockPath = Join-Path $backendDir "uv.lock"
+            if ((Test-Path $uvLockPath) -and (Get-Command uv -ErrorAction SilentlyContinue)) {
+                Write-Host "Regenerating uv.lock after pyproject.toml patch"
+                Push-Location $backendDir
+                try {
+                    Remove-Item -Path "uv.lock" -Force -ErrorAction SilentlyContinue
+                    uv lock
+                } catch {
+                    Write-Host "[openclaw-easy] Warning: Failed to regenerate uv.lock. Docker build may use cached dependencies."
+                } finally {
+                    Pop-Location
+                }
+            }
         }
     }
 

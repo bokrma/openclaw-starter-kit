@@ -604,11 +604,17 @@ PY
 
   [[ -f "$backend_pyproject" ]] && python3 - "$backend_pyproject" <<'PY'
 import sys
+import re
 from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text(encoding="utf-8")
 updated = text.replace("clerk-backend-api==4.2.0", "clerk-backend-api==5.0.2")
+
+# Remove any duplicate/conflicting cryptography entries (like cryptography==45.0.7)
+updated = re.sub(r'\s*"cryptography==[\d\.]+",?\n?', '', updated)
+
+# Ensure the correct cryptography constraint is present
 if '"cryptography>=46.0.5,<47"' not in updated:
     updated = updated.replace(
         '"clerk-backend-api==5.0.2",',
@@ -618,6 +624,17 @@ if updated != text:
     path.write_text(updated, encoding="utf-8")
     print("[openclaw-easy] Patched Mission Control backend dependency baseline.")
 PY
+
+  # Regenerate uv.lock if pyproject.toml was patched
+  if [[ -f "$backend_pyproject" ]] && command -v uv >/dev/null 2>&1; then
+    local backend_dir
+    backend_dir="$(dirname "$backend_pyproject")"
+    if [[ -f "$backend_dir/uv.lock" ]]; then
+      log "Regenerating uv.lock after pyproject.toml patch"
+      (cd "$backend_dir" && rm -f uv.lock && uv lock) || \
+        printf "[openclaw-easy] Warning: Failed to regenerate uv.lock. Docker build may use cached dependencies.\n"
+    fi
+  fi
 
   [[ -f "$backend_dockerfile" ]] && python3 - "$backend_dockerfile" <<'PY'
 import sys
@@ -630,6 +647,20 @@ if updated != text:
     path.write_text(updated, encoding="utf-8")
     print("[openclaw-easy] Patched Mission Control backend Docker dependency sync mode.")
 PY
+}
+
+patch_openclaw_telegram_monitor_strict_null() {
+  local src_dir="${1:-$OPENCLAW_SRC_DIR}"
+  local monitor_file="$src_dir/src/telegram/monitor.ts"
+  [[ -f "$monitor_file" ]] || return 0
+  # Fix TS18048: 'opts.abortSignal' is possibly 'undefined' on the addEventListener call.
+  # The property is optional but used inside a guard that already checked it is defined;
+  # TypeScript cannot narrow mutable object properties across closures, so we add '!'.
+  if grep -q 'opts\.abortSignal\.addEventListener' "$monitor_file" 2>/dev/null; then
+    sed -i.bak 's/opts\.abortSignal\.addEventListener/opts.abortSignal!.addEventListener/g' "$monitor_file"
+    rm -f "${monitor_file}.bak"
+    printf "[openclaw-easy] Patched telegram monitor strict null check.\n"
+  fi
 }
 
 repair_mission_control_onboarding_sessions() {
@@ -1019,10 +1050,10 @@ configure_agents() {
   done < <(load_openclaw_agent_rows)
   [[ "${#agent_rows[@]}" -gt 0 ]] || fail "No agents found in $OPENCLAW_AGENT_MANIFEST_FILE"
 
-  compose run --rm openclaw-cli config set agents.defaults.model.primary openai/gpt-5.2
+  compose run --rm openclaw-cli config set agents.defaults.model.primary openai/gpt-5.2 2>&1 | grep -v "Restart the gateway" || true
   compose run --rm openclaw-cli config unset agents.defaults.model.fallbacks >/dev/null 2>&1 || true
-  compose run --rm openclaw-cli config set 'agents.defaults.model.fallbacks[0]' openai/gpt-5-mini
-  compose run --rm openclaw-cli config set agents.defaults.maxConcurrent 10 --json
+  compose run --rm openclaw-cli config set 'agents.defaults.model.fallbacks[0]' openai/gpt-5-mini 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set agents.defaults.maxConcurrent 10 --json 2>&1 | grep -v "Restart the gateway" || true
   compose run --rm openclaw-cli config unset agents.list >/dev/null 2>&1 || true
   local index=0
   local row=""
@@ -1032,45 +1063,45 @@ configure_agents() {
   local agent_is_default=""
   for row in "${agent_rows[@]}"; do
     IFS='|' read -r agent_id agent_name agent_workspace agent_is_default <<< "$row"
-    compose run --rm openclaw-cli config set "agents.list[$index].id" "$agent_id"
-    compose run --rm openclaw-cli config set "agents.list[$index].name" "$agent_name"
-    compose run --rm openclaw-cli config set "agents.list[$index].identity.name" "$agent_name"
-    compose run --rm openclaw-cli config set "agents.list[$index].workspace" "$agent_workspace"
+    compose run --rm openclaw-cli config set "agents.list[$index].id" "$agent_id" 2>&1 | grep -v "Restart the gateway" || true
+    compose run --rm openclaw-cli config set "agents.list[$index].name" "$agent_name" 2>&1 | grep -v "Restart the gateway" || true
+    compose run --rm openclaw-cli config set "agents.list[$index].identity.name" "$agent_name" 2>&1 | grep -v "Restart the gateway" || true
+    compose run --rm openclaw-cli config set "agents.list[$index].workspace" "$agent_workspace" 2>&1 | grep -v "Restart the gateway" || true
     if [[ "$agent_is_default" == "true" ]]; then
-      compose run --rm openclaw-cli config set "agents.list[$index].default" true
-      compose run --rm openclaw-cli config set "agents.list[$index].subagents.allowAgents[0]" "*"
+      compose run --rm openclaw-cli config set "agents.list[$index].default" true 2>&1 | grep -v "Restart the gateway" || true
+      compose run --rm openclaw-cli config set "agents.list[$index].subagents.allowAgents[0]" "*" 2>&1 | grep -v "Restart the gateway" || true
     fi
     index=$((index + 1))
   done
-  compose run --rm openclaw-cli config set tools.agentToAgent.enabled true --json
+  compose run --rm openclaw-cli config set tools.agentToAgent.enabled true --json 2>&1 | grep -v "Restart the gateway" || true
   compose run --rm openclaw-cli config unset tools.agentToAgent.allow >/dev/null 2>&1 || true
-  compose run --rm openclaw-cli config set 'tools.agentToAgent.allow[0]' "*"
-  compose run --rm openclaw-cli config set commands.bash true --json
-  compose run --rm openclaw-cli config set tools.elevated.enabled true --json
+  compose run --rm openclaw-cli config set 'tools.agentToAgent.allow[0]' "*" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set commands.bash true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set tools.elevated.enabled true --json 2>&1 | grep -v "Restart the gateway" || true
   compose run --rm openclaw-cli config unset tools.elevated.allowFrom.web >/dev/null 2>&1 || true
   compose run --rm openclaw-cli config unset tools.elevated.allowFrom.webchat >/dev/null 2>&1 || true
-  compose run --rm openclaw-cli config set 'tools.elevated.allowFrom.webchat[0]' "*"
+  compose run --rm openclaw-cli config set 'tools.elevated.allowFrom.webchat[0]' "*" 2>&1 | grep -v "Restart the gateway" || true
 }
 
 configure_memory_defaults() {
-  compose run --rm openclaw-cli config set agents.defaults.memorySearch.enabled true --json
-  compose run --rm openclaw-cli config set agents.defaults.memorySearch.provider openai
+  compose run --rm openclaw-cli config set agents.defaults.memorySearch.enabled true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set agents.defaults.memorySearch.provider openai 2>&1 | grep -v "Restart the gateway" || true
   compose run --rm openclaw-cli config unset agents.defaults.memorySearch.sources >/dev/null 2>&1 || true
-  compose run --rm openclaw-cli config set 'agents.defaults.memorySearch.sources[0]' memory
-  compose run --rm openclaw-cli config set 'agents.defaults.memorySearch.sources[1]' sessions
-  compose run --rm openclaw-cli config set agents.defaults.memorySearch.experimental.sessionMemory true --json
-  compose run --rm openclaw-cli config set agents.defaults.memorySearch.sync.onSessionStart true --json
-  compose run --rm openclaw-cli config set agents.defaults.memorySearch.sync.onSearch true --json
+  compose run --rm openclaw-cli config set 'agents.defaults.memorySearch.sources[0]' memory 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set 'agents.defaults.memorySearch.sources[1]' sessions 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set agents.defaults.memorySearch.experimental.sessionMemory true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set agents.defaults.memorySearch.sync.onSessionStart true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set agents.defaults.memorySearch.sync.onSearch true --json 2>&1 | grep -v "Restart the gateway" || true
 }
 
 configure_exec_policy_mode() {
   local mode="${1:-prompt}"
   if [[ "$mode" == "allow" ]]; then
-    compose run --rm openclaw-cli config set tools.exec.ask off
-    compose run --rm openclaw-cli config set tools.exec.security full
+    compose run --rm openclaw-cli config set tools.exec.ask off 2>&1 | grep -v "Restart the gateway" || true
+    compose run --rm openclaw-cli config set tools.exec.security full 2>&1 | grep -v "Restart the gateway" || true
   else
-    compose run --rm openclaw-cli config set tools.exec.ask on-miss
-    compose run --rm openclaw-cli config set tools.exec.security allowlist
+    compose run --rm openclaw-cli config set tools.exec.ask on-miss 2>&1 | grep -v "Restart the gateway" || true
+    compose run --rm openclaw-cli config set tools.exec.security allowlist 2>&1 | grep -v "Restart the gateway" || true
   fi
 }
 
@@ -1365,6 +1396,7 @@ main() {
   fi
 
   clone_or_update_openclaw
+  patch_openclaw_telegram_monitor_strict_null "$OPENCLAW_SRC_DIR"
   ensure_safe_compose_file
   sync_vendor_env_file
 
@@ -1376,51 +1408,53 @@ main() {
     "$OPENCLAW_SRC_DIR"
 
   log "Initializing gateway + auth"
-  compose run --rm openclaw-cli config set gateway.mode local
-  compose run --rm openclaw-cli config set gateway.auth.mode token
-  compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN"
-  compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json
-  compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json
+  compose run --rm openclaw-cli config set gateway.mode local 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.auth.mode token 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json 2>&1 | grep -v "Restart the gateway" || true
+  log "Gateway configuration updated. Restart the gateway to apply changes."
   compose run --rm openclaw-cli onboard \
     --non-interactive --accept-risk \
     --auth-choice openai-api-key \
     --openai-api-key "$OPENAI_API_KEY" \
     --skip-channels --skip-skills --skip-health --no-install-daemon
-  compose run --rm openclaw-cli config set gateway.mode local
-  compose run --rm openclaw-cli config set gateway.auth.mode token
-  compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN"
-  compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json
-  compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json
+  compose run --rm openclaw-cli config set gateway.mode local 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.auth.mode token 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.auth.token "$OPENCLAW_GATEWAY_TOKEN" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.controlUi.allowInsecureAuth true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set gateway.controlUi.dangerouslyDisableDeviceAuth true --json 2>&1 | grep -v "Restart the gateway" || true
+  log "Gateway configuration updated. Restart the gateway to apply changes."
 
   log "Loading local agent specs from openclaw-agents/agents"
   split_openclaw_agent_files
   sync_openclaw_agent_workspaces
 
   log "Applying defaults (CLI backends, concurrency, agent pack)"
-  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[claude-cli].command" "/home/node/.openclaw/tools/bin/claude"
-  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].command" "/home/node/.openclaw/tools/bin/codex"
-  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].env.OPENAI_API_KEY" '${OPENAI_API_KEY}'
-  compose run --rm openclaw-cli config set agents.defaults.subagents.maxConcurrent 8 --json
+  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[claude-cli].command" "/home/node/.openclaw/tools/bin/claude" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].command" "/home/node/.openclaw/tools/bin/codex" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].env.OPENAI_API_KEY" '${OPENAI_API_KEY}' 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set agents.defaults.subagents.maxConcurrent 8 --json 2>&1 | grep -v "Restart the gateway" || true
   configure_agents
   configure_exec_policy_mode "$exec_mode"
   sync_exec_approvals_mode "$exec_mode"
   configure_memory_defaults
-  compose run --rm openclaw-cli config set browser.enabled true --json
-  compose run --rm openclaw-cli config set browser.headless true --json
-  compose run --rm openclaw-cli config set browser.noSandbox true --json
-  compose run --rm openclaw-cli config set browser.defaultProfile openclaw
+  compose run --rm openclaw-cli config set browser.enabled true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set browser.headless true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set browser.noSandbox true --json 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set browser.defaultProfile openclaw 2>&1 | grep -v "Restart the gateway" || true
 
   if [[ "${OPENCLAW_ENABLE_SUPERMEMORY}" == "true" ]]; then
     log "Installing and configuring Supermemory plugin"
     if ! compose run --rm openclaw-cli plugins info openclaw-supermemory --json >/dev/null 2>&1; then
       compose run --rm openclaw-cli plugins install @supermemory/openclaw-supermemory
     fi
-    compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.enabled true --json
-    compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.config.apiKey '${SUPERMEMORY_OPENCLAW_API_KEY}'
+    compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.enabled true --json 2>&1 | grep -v "Restart the gateway" || true
+    compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.config.apiKey '${SUPERMEMORY_OPENCLAW_API_KEY}' 2>&1 | grep -v "Restart the gateway" || true
   else
     log "Skipping Supermemory plugin (no key provided)"
     if compose run --rm openclaw-cli plugins info openclaw-supermemory --json >/dev/null 2>&1; then
-      compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.enabled false --json || true
+      compose run --rm openclaw-cli config set plugins.entries.openclaw-supermemory.enabled false --json 2>&1 | grep -v "Restart the gateway" || true
     fi
   fi
 
@@ -1588,9 +1622,10 @@ SH
   rm -f "$tmp_sh"
 
   log "Finalizing CLI backend commands"
-  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[claude-cli].command" "/home/node/.openclaw/tools/bin/claude"
-  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].command" "/home/node/.openclaw/tools/bin/codex"
-  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].env.OPENAI_API_KEY" '${OPENAI_API_KEY}'
+  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[claude-cli].command" "/home/node/.openclaw/tools/bin/claude" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].command" "/home/node/.openclaw/tools/bin/codex" 2>&1 | grep -v "Restart the gateway" || true
+  compose run --rm openclaw-cli config set "agents.defaults.cliBackends[codex-cli].env.OPENAI_API_KEY" '${OPENAI_API_KEY}' 2>&1 | grep -v "Restart the gateway" || true
+  log "Configuration complete. Restart the gateway to apply all changes."
 
   log "Priming long-memory search index"
   compose run --rm openclaw-cli memory index --agent main >/dev/null 2>&1 || \
